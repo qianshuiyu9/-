@@ -1,4 +1,13 @@
+import sys
 import argparse
+# Windows 默认 GBK 控制台无法显示 emoji，强制切 UTF-8
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from excel_processor import process_all
 from yc_processor import process_yuanchuang_all
 from uploader import PlatformUploader

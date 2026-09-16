@@ -10,10 +10,8 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 from config import (
     INPUT_DIR, OUTPUT_DIR, TARGET_COLUMNS, COLUMN_MAPPING,
     SPEC_REGEX, SKIP_SPEC_KEYWORDS, FIXED_INTEGRAL_MULTIPLIER,
-    UNIT_FIXED_VALUE, SUPPLIER_IMAGE_SOURCES, DEFAULT_FIELD_VALUES,
+    UNIT_FIXED_VALUE, DEFAULT_FIELD_VALUES,
 )
-from image_fetcher import bytes_to_openpyxl_image, MiniProgramImageFetcher
-from uploader import extract_supplier_name
 
 
 def _round_half_up(value, ndigits=2):
@@ -615,6 +613,11 @@ def _extract_spec_from_text(text):
 
     for m in re.finditer(SPEC_REGEX, text, re.IGNORECASE):
         matched = m.group(0)
+
+        if m.group("count") and count_applied:
+            # 已拆解过一次，后续 count（如"8瓶"、"4瓶"）不再处理：不删、不加 spec_parts
+            continue
+
         spec_parts.append(matched)
         # 只替换当前这一处匹配，避免同名片段被误删
         cleaned = cleaned.replace(matched, "", 1)
@@ -633,11 +636,10 @@ def _extract_spec_from_text(text):
             multiplier *= a * unit_val
         elif m.group("count"):
             # 只取第一个 count 作为倍数（如"24入3入"只取24，不乘3）
-            if not count_applied:
-                num = _to_num(m.group("count_num"))
-                unit = m.group("count_unit")
-                multiplier *= num * UNIT_FIXED_VALUE.get(unit, 1)
-                count_applied = True
+            num = _to_num(m.group("count_num"))
+            unit = m.group("count_unit")
+            multiplier *= num * UNIT_FIXED_VALUE.get(unit, 1)
+            count_applied = True
         # vw（体积/重量）：只记录规格，不改变倍数
 
     return multiplier, spec_parts, cleaned
@@ -1123,16 +1125,11 @@ def deduplicate_products(df, img_map, row_to_header_row):
     return new_df, new_row_to_header
 
 
-def _write_output_with_images(df, img_map, row_to_header_row, output_path,
-                              fetched_images=None, fetch_image_size=(80, 80)):
-    """写入标准表格，并把图片（源表格自带 或 抓取得到）填入"图片"列。
+def _write_output_with_images(df, img_map, row_to_header_row, output_path):
+    """写入标准表格，并把源表格自带图片填入"图片"列。
 
     图片采用"填充于单元格内"策略：设定固定的单元格尺寸，将图片按比例缩放
     后填入，而不是用图片尺寸去撑大单元格。
-
-    Args:
-        fetched_images: dict，键为输出行的 0 基索引（即 out_row_idx - 2），
-                        值为图片二进制 bytes。
     """
     wb = Workbook()
     ws = wb.active
@@ -1142,7 +1139,6 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path,
         ws.cell(row=1, column=col_idx, value=col_name)
 
     img_col_idx = TARGET_COLUMNS.index("图片") + 1 if "图片" in TARGET_COLUMNS else None
-    fetched_images = fetched_images or {}
 
     # 图片列与单元格尺寸（Excel 列宽单位≈字符宽，行高单位=磅；1磅≈1.333像素）
     IMG_COL_WIDTH = 14          # ≈ 100px
@@ -1173,7 +1169,7 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path,
 
         img_data = None
 
-        # 1) 优先用源表格自带的图片（按高分辨率缩放，保证清晰度）
+        # 用源表格自带的图片（按高分辨率缩放，保证清晰度）
         if img_map and row_to_header_row and img_col_idx:
             orig_row_num = row_to_header_row.get(out_row_idx - 2)
             if orig_row_num is not None and orig_row_num in img_map:
@@ -1182,12 +1178,6 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path,
                     img_data = _resize_image_bytes(raw, IMG_RES_W, IMG_RES_H)
                 except Exception:
                     img_data = None
-
-        # 2) 源表格无图时，用抓取得到的图片
-        if img_data is None and img_col_idx:
-            data = fetched_images.get(out_row_idx - 2)
-            if data:
-                img_data = _resize_image_bytes(data, IMG_RES_W, IMG_RES_H)
 
         if img_data and img_col_idx:
             image_items.append((out_row_idx, img_col_idx, img_data))
@@ -1310,51 +1300,7 @@ def process_single_file(filepath, supplier_name=""):
     out_basename = re.sub(r'[\\/:*?"<>|]', "_", out_basename)
     output_path = os.path.join(out_dir, out_basename)
 
-    # ----- 供应商图片抓取 -----
-    fetched_images = {}
-    fetch_image_size = (80, 80)
-    supplier = supplier_name or extract_supplier_name(filename)
-    supplier_cfg = SUPPLIER_IMAGE_SOURCES.get(supplier) if supplier else None
-    is_wechat_mode = supplier_cfg and supplier_cfg.get("search_mode") == "wechat"
-    need_fetch = (
-        supplier_cfg
-        and supplier_cfg.get("enabled")
-        and (
-            is_wechat_mode
-            or (supplier_cfg.get("search_url") and "{keyword}" in supplier_cfg["search_url"])
-        )
-        and not img_map  # 源表格没有图片时才抓取
-    )
-
-    if need_fetch:
-        print(f"    🛒 厂家 [{supplier}] 源表格无图片，开始从小程序抓取...")
-        fetch_image_size = supplier_cfg.get("image_size", (80, 80))
-        keywords = [str(row.get("展示名") or row.get("名称") or "").strip()
-                    for _, row in df.iterrows()]
-        fetcher = MiniProgramImageFetcher(headless=True)
-        try:
-            fetcher.start(supplier_cfg)
-            try:
-                def _on_progress(idx, kw, ok):
-                    mark = "✓" if ok else "✗"
-                    print(f"      {mark} [{idx + 1}/{len(keywords)}] {kw}")
-                fetched = fetcher.fetch_images(keywords, supplier_cfg, on_progress=_on_progress)
-                for i, kw in enumerate(keywords):
-                    data = fetched.get(kw)
-                    if data:
-                        fetched_images[i] = data
-                ok_cnt = sum(1 for v in fetched.values() if v)
-                print(f"    抓取完成: {ok_cnt}/{len(keywords)} 张")
-            finally:
-                fetcher.close()
-        except Exception as e:
-            # 抓取失败不影响表格生成，只是没有图片
-            print(f"    [警告] 图片抓取失败，跳过（表格仍会生成）: {e}")
-
-    _write_output_with_images(
-        df, img_map, row_to_header_row, output_path,
-        fetched_images=fetched_images, fetch_image_size=fetch_image_size,
-    )
+    _write_output_with_images(df, img_map, row_to_header_row, output_path)
 
     print(f"    ✓ 输出: {out_basename}  ({original_rows} → {len(df)} 条)")
     if spec_change_count > 0:
@@ -1365,8 +1311,6 @@ def process_single_file(filepath, supplier_name=""):
         print(f"    ⚠ 需人工复核（含规格单位但无法确定倍数，已用原数量单价，展示名带⚠）: {len(review_items)} 行")
         for nm in review_items:
             print(f"        - {nm}")
-    if fetched_images:
-        print(f"    🖼 抓取图片: {len(fetched_images)} 张")
 
     return {
         "name": out_basename,
@@ -1379,7 +1323,6 @@ def process_single_file(filepath, supplier_name=""):
         "review_items": review_items,
         "unmatched_cols": unmatched,
         "image_count": len(img_map) if img_map else 0,
-        "fetched_image_count": len(fetched_images),
     }
 
 
