@@ -779,6 +779,45 @@ def _jjl_classify_spec_tag(name):
     return "生活类", "生活用品"
 
 
+# ===== 豪仕厂家专属：规格/标签按名称关键词分类 + 特定规则拆解 =====
+_HS_STATIONERY_KW = [
+    "素描本", "磁扣本", "手账本", "套尺", "橡皮檫", "橡皮擦", "画本", "便签",
+    "订书机", "马克笔", "笔袋", "削笔机", "削笔刀", "板夹", "中性笔", "笔筒",
+    "圆规", "中性盲盒笔", "线圈本", "套规",
+]
+_HS_LIVING_KW = ["剪刀", "收纳盒"]
+_HS_TOY_KW = [
+    "指读棒", "拼图", "涂鸦本", "迷你解压", "飞机枪", "考古挖掘", "寻宝",
+    "拼豆机", "猜猜我是谁", "弹力球", "按键", "沙滩车", "卷发人",
+    "夜光恐龙", "弓弩枪", "散弹枪", "手作球", "手作套装", "计时器",
+    "印章", "伸缩棒", "假水",
+]
+
+# 规则4：固定按10入拆解的货品
+_HS_10X_NAME = "爆款3D浮雕泠烫吧唧+透卡"
+
+
+def _hs_classify_spec_tag(name):
+    """豪仕：根据货品名称判定规格和标签。
+
+    优先级：文具(生活类/文具) > 生活用品(生活类/生活用品) > 玩具(玩具类/儿童玩具)。
+    """
+    if any(kw in name for kw in _HS_STATIONERY_KW):
+        return "生活类", "文具"
+    if any(kw in name for kw in _HS_LIVING_KW):
+        return "生活类", "生活用品"
+    if any(kw in name for kw in _HS_TOY_KW):
+        return "玩具类", "儿童玩具"
+    # 规则4：特定货品 → 玩具类/儿童玩具
+    if _HS_10X_NAME in name:
+        return "玩具类", "儿童玩具"
+    # 规则5：诺-*盲盒 → 玩具类/儿童玩具
+    if re.search(r"诺[-—].*盲盒", name):
+        return "玩具类", "儿童玩具"
+    # 默认：玩具类/儿童玩具（豪仕主打盲盒玩具）
+    return "玩具类", "儿童玩具"
+
+
 def _extract_deal_amount(filepath):
     """从原始表格的元数据区提取"成交金额"标签右侧单元格的值（整单成交总额）。"""
     try:
@@ -946,6 +985,46 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["单价"] = price if price != 0 else ""
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["条码"] = ""  # 条码列不填
+        row["_needs_review"] = False
+        return row
+
+    # ===== 豪仕厂家专属逻辑 =====
+    is_haoshi = supplier_name == "豪仕"
+    if is_haoshi:
+        # 规则4：特定货品固定按10入拆解
+        spec_multiple = 1
+        if _HS_10X_NAME in original_name:
+            spec_multiple = 10
+        # 规则5：诺-*盲盒 且 单价>20 → 按48入拆解
+        elif re.search(r"诺[-—].*盲盒", original_name) and price > 20:
+            spec_multiple = 48
+
+        # 规格/标签按关键词分类
+        spec_val, tag_val = _hs_classify_spec_tag(original_name)
+
+        # 展示名清理（如果有固定拆解倍数则去掉"N入"）
+        cleaned_name = original_name
+        if spec_multiple > 1:
+            m = re.search(r"(\d+)\s*入", original_name)
+            if m:
+                cleaned_name = original_name[:m.start()] + original_name[m.end():]
+        display_name = _clean_display_name(cleaned_name)
+
+        # 数量 × 倍数，单价 ÷ 倍数
+        if spec_multiple > 1 and qty > 0:
+            qty = qty * spec_multiple
+            if price > 0:
+                price = _round_half_up(price / spec_multiple, 2)
+
+        row["名称"] = original_name
+        row["展示名"] = display_name if display_name else original_name
+        row["规格"] = spec_val
+        row["用途"] = DEFAULT_FIELD_VALUES.get("用途", "")
+        row["标签"] = tag_val
+        row["单位"] = DEFAULT_FIELD_VALUES.get("单位", row.get("单位", ""))
+        row["进货数量"] = qty if qty != 0 else ""
+        row["单价"] = price if price != 0 else ""
+        row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["_needs_review"] = False
         return row
 
@@ -1135,10 +1214,13 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path):
     ws = wb.active
     ws.title = "Sheet1"
 
-    for col_idx, col_name in enumerate(TARGET_COLUMNS, 1):
+    # 按 TARGET_COLUMNS 的顺序输出，但只保留 df 中实际存在的列
+    _cols = [c for c in TARGET_COLUMNS if c in df.columns]
+
+    for col_idx, col_name in enumerate(_cols, 1):
         ws.cell(row=1, column=col_idx, value=col_name)
 
-    img_col_idx = TARGET_COLUMNS.index("图片") + 1 if "图片" in TARGET_COLUMNS else None
+    img_col_idx = _cols.index("图片") + 1 if "图片" in _cols else None
 
     # 图片列与单元格尺寸（Excel 列宽单位≈字符宽，行高单位=磅；1磅≈1.333像素）
     IMG_COL_WIDTH = 14          # ≈ 100px
@@ -1159,7 +1241,7 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path):
     image_items = []
 
     for out_row_idx, (_, row) in enumerate(df.iterrows(), start=2):
-        for col_idx, col_name in enumerate(TARGET_COLUMNS, 1):
+        for col_idx, col_name in enumerate(_cols, 1):
             if col_name == "图片":
                 continue
             ws.cell(row=out_row_idx, column=col_idx, value=row.get(col_name, ""))
@@ -1183,7 +1265,7 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path):
             image_items.append((out_row_idx, img_col_idx, img_data))
 
     # 列宽自适应：按每列最大内容长度计算宽度（图片列保持固定宽度）
-    for col_idx, col_name in enumerate(TARGET_COLUMNS, 1):
+    for col_idx, col_name in enumerate(_cols, 1):
         if img_col_idx and col_idx == img_col_idx:
             continue
         max_len = len(str(col_name))
@@ -1288,6 +1370,10 @@ def process_single_file(filepath, supplier_name=""):
         if len(df) > 0:
             df.loc[df.index[0], "总金额"] = deal_amount
 
+    # 豪仕：不输出总金额列
+    if supplier_name == "豪仕":
+        df = df.drop(columns=["总金额"], errors="ignore")
+
     # 输出目录：OUTPUT_DIR/{厂家名}/  文件名：使用原表格名称
     store_name = extract_store_name(filename, supplier_name)
     safe_supplier = supplier_name if supplier_name else "未分类"
@@ -1357,6 +1443,9 @@ def process_all():
 
     results = []
     for supplier_name, f in files:
+        # 原创厂家由 yc_processor 独立处理，这里跳过
+        if supplier_name == "原创":
+            continue
         try:
             result = process_single_file(f, supplier_name=supplier_name)
             results.append(result)

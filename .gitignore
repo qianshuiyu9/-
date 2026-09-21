@@ -19,6 +19,19 @@ Thumbs.db
 Desktop.ini
 ~$*
 
-# Output/data (generated files, not source code)
-# 桌面\处理后标准表格\
-# 桌面\原始数据文件\
+# PyArmor runtime / PyInstaller temp
+pyarmor_runtime_000000/
+dist_encrypted/
+*.spec
+auth.py.orig
+main.py.orig
+
+# 敏感：auth.py 含盐值秘密，绝不上传
+auth.py
+setup_auth.py
+daily_code.py
+
+# 构建残留
+auth.c
+.agents/
+skills-lock.json
