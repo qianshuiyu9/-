@@ -291,6 +291,104 @@ def _convert_xls_to_xlsx(src_xls, dst_xlsx):
         return False
 
 
+def _extract_images_via_com(filepath, header_row_idx):
+    """用 Excel COM 从源文件（.xls 或 .xlsx）提取图片并映射到 Excel 行号。
+
+    适用于 openpyxl 读不到的图片格式（如 WMF/EMF）。
+    返回 {excel_row_1based: jpeg_bytes, ...}。
+    """
+    import tempfile as _tmp
+    import subprocess as _sp
+    from win32com.client import Dispatch
+
+    tmp_dir = os.path.join(_tmp.gettempdir(), "_candy_imgs_" + str(os.getpid()))
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    img_map = {}
+    try:
+        excel = Dispatch('Excel.Application')
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(os.path.abspath(filepath))
+        ws = wb.ActiveSheet
+
+        # 扫描表头找"商品名称"在哪一列（不同厂家/文件位置不同）
+        name_col = 3  # 默认 C 列
+        for scan_r in range(1, 16):
+            for scan_c in range(1, 20):
+                v = ws.Cells.Item(scan_r, scan_c).Value
+                if v is None:
+                    continue
+                vs = str(v).strip()
+                if any(kw in vs for kw in ("商品名称", "货名", "货品名称", "商品全名", "品名")):
+                    name_col = scan_c
+                    break
+            if name_col != 3:
+                break
+
+        # 收集所有 Shape（Type=13 是 msoPicture）
+        shapes_info = []
+        for i in range(1, ws.Shapes.Count + 1):
+            s = ws.Shapes.Item(i)
+            try:
+                if s.Type == 13:  # msoPicture
+                    shapes_info.append((s.Top, s))
+            except Exception:
+                pass
+        shapes_info.sort(key=lambda x: x[0])
+
+        # 按 Top 反推行号（同时跳过非数据行：运费/合计等）
+        _SKIP_NAMES = {"运费", "合计", "欠款"}
+        for idx, (top, shape) in enumerate(shapes_info):
+            excel_row = None
+            for r in range(header_row_idx + 1, header_row_idx + 1 + 60):
+                r_top = ws.Rows(r).Top
+                r_bottom = r_top + ws.Rows(r).Height
+                if r_top <= top < r_bottom:
+                    excel_row = r
+                    break
+                if r_top > top:
+                    excel_row = r - 1
+                    break
+            if excel_row is None:
+                continue
+
+            # 跳过非数据行的图片（运费行、合计行等源表里可能也有占位图）
+            name_cell = ws.Cells.Item(excel_row, name_col).Value
+            if name_cell is not None:
+                ns = str(name_cell).strip()
+                if ns in _SKIP_NAMES or ns == "":
+                    continue
+
+            # SaveAsPicture 导出 JPEG
+            jpg_path = os.path.join(tmp_dir, f"img_{idx}.jpg")
+            try:
+                shape.SaveAsPicture(jpg_path)
+                if os.path.exists(jpg_path) and os.path.getsize(jpg_path) > 0:
+                    with open(jpg_path, "rb") as fp:
+                        img_map[excel_row] = fp.read()
+            except Exception:
+                pass
+
+        wb.Close(False)
+        excel.Quit()
+    except Exception as e:
+        print(f"    [警告] COM 图片提取失败: {e}")
+        try:
+            excel.Quit()
+        except Exception:
+            pass
+    finally:
+        # 清理临时文件
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return img_map
+
+
 def _finalize_xlsx_package(xlsx_path, sheet_name="Sheet1"):
     """openpyxl 保存后补全 OOXML 部件。
 
@@ -950,7 +1048,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
     is_xxwj = supplier_name == "小小玩具"
     if is_xxwj:
         # 小小玩具不做规格拆解，按名称关键词/单价/尺寸判定规格和标签
-        _xxwj_keywords = ["香袋", "掌中宝", "挂件", "迷你", "桌伴"]
+        _xxwj_keywords = ["香袋", "掌中宝", "挂件", "迷你", "桌伴", "挂绳"]
         has_keyword = any(kw in original_name for kw in _xxwj_keywords)
 
         # 从"尺寸"列（原"型号"列）提取厘米数用于规则判定，但保留原始值输出
@@ -1022,6 +1120,49 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["用途"] = DEFAULT_FIELD_VALUES.get("用途", "")
         row["标签"] = tag_val
         row["单位"] = DEFAULT_FIELD_VALUES.get("单位", row.get("单位", ""))
+        row["进货数量"] = qty if qty != 0 else ""
+        row["单价"] = price if price != 0 else ""
+        row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
+        row["_needs_review"] = False
+        return row
+
+    # ===== 糖果厂家专属规格/标签逻辑 =====
+    if supplier_name == "糖果":
+        # 不做规格拆解，按规则判定规格和标签
+        name = original_name
+
+        # 从名称提取 cm 尺寸数字（如 35cm, 40cm*30cm, (25cm)）
+        cm_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*cm", name, re.IGNORECASE)
+        cm_max = max(float(n) for n in cm_numbers) if cm_numbers else None
+
+        # 优先级从高到低
+        last_cn = name[-1] if name else ""
+
+        if last_cn == "包" and "迷你" not in name:
+            # 规则4: 名称以"包"结尾，不含"迷你" → 生活类/箱包
+            spec_val, tag_val = "生活类", "箱包"
+        elif "迷你" in name:
+            # 规则4补充: 含"迷你"（即使是包）→ 芭比（5-10cm）
+            spec_val, tag_val = "芭比（5-10cm）", "公仔"
+        elif re.search(r"[46]寸", name):
+            # 规则3: 含"4寸"/"6寸" → 芭比
+            spec_val, tag_val = "芭比（5-10cm）", "公仔"
+        elif cm_max is not None and cm_max > 20:
+            # 规则2: 含 cm 且最大尺寸 > 20 → 12-18寸
+            spec_val, tag_val = "12-18寸（40-50cm）", "公仔"
+        elif price > 9:
+            # 规则1: 单价 > 9 → 12-18寸
+            spec_val, tag_val = "12-18寸（40-50cm）", "公仔"
+        else:
+            # 规则5: 其他 → 7寸（20cm）
+            spec_val, tag_val = "7寸（20cm）", "公仔"
+
+        row["名称"] = original_name
+        row["展示名"] = original_name  # 糖果展示名不清理
+        row["规格"] = spec_val
+        row["用途"] = "兑换, 零售"
+        row["标签"] = tag_val
+        row["单位"] = "个"
         row["进货数量"] = qty if qty != 0 else ""
         row["单价"] = price if price != 0 else ""
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
@@ -1304,6 +1445,31 @@ def process_single_file(filepath, supplier_name=""):
     df, img_map, row_to_header_row = read_with_images(filepath)
     original_rows = len(df)
 
+    # 糖果厂家：源文件图片是 WMF/EMF 格式，openpyxl 读不到 → 用 COM SaveAsPicture 提取
+    if supplier_name == "糖果" and not img_map:
+        from openpyxl import load_workbook as _lb
+        # 先确定表头行号（read_with_images 已经用 header_row_idx 算好了 row_to_header_row 的 values）
+        header_row_idx = None
+        if row_to_header_row:
+            # row_to_header_row: {data_idx: excel_row_1based}
+            # excel_row = header_row_idx + 1 + data_idx → header_row_idx = excel_row - 1 - data_idx
+            first_data_idx = min(row_to_header_row.keys())
+            first_excel_row = row_to_header_row[first_data_idx]
+            header_row_idx = first_excel_row - 1 - first_data_idx
+        if header_row_idx is None:
+            header_row_idx = 7  # 糖果表固定表头在第7行
+        print(f"    🖼 openpyxl 未读到图片，尝试 COM 提取 (表头行={header_row_idx})")
+        com_img_map = _extract_images_via_com(filepath, header_row_idx)
+        if com_img_map:
+            # 包装 bytes 成有 ._data() 方法的对象，兼容 _write_output_with_images
+            class _BytesWrapper:
+                def __init__(self, data):
+                    self._raw = data
+                def _data(self):
+                    return self._raw
+            img_map = {r: _BytesWrapper(data) for r, data in com_img_map.items()}
+            print(f"    🖼 COM 提取到 {len(img_map)} 张图片")
+
     # 提取整单"成交金额"（用于小小玩具的总金额列）
     deal_amount = _extract_deal_amount(filepath) if supplier_name == "小小玩具" else None
     if supplier_name == "小小玩具":
@@ -1342,8 +1508,24 @@ def process_single_file(filepath, supplier_name=""):
     # 合并重复货品（按条码，无条码按展示名）
     df, row_to_header_row = deduplicate_products(df, img_map, row_to_header_row)
 
-    # 过滤非数据行：合计行、欠款行、表头残留行、备注行等
-    _non_data_keywords = ["合计", "欠款", "注：", "注:", "本次成交", "上次欠款"]
+    # 糖果厂家：提取运费金额（单价×数量），文件名里要加
+    candy_fee = None
+    if supplier_name == "糖果":
+        for _, r in df.iterrows():
+            if str(r.get("名称", "")).strip() == "运费":
+                try:
+                    fp = float(r.get("单价", 0)) if pd.notna(r.get("单价")) else 0
+                    fq = float(r.get("进货数量", 0)) if pd.notna(r.get("进货数量")) else 0
+                    candy_fee = fp * fq
+                    if candy_fee == 0:
+                        candy_fee = fp or fq
+                    print(f"    💰 运费: {candy_fee} 元")
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+    # 过滤非数据行：合计行、欠款行、表头残留行、备注行、运费行等
+    _non_data_keywords = ["合计", "欠款", "注：", "注:", "本次成交", "上次欠款", "运费"]
     _header_residue = {"商品全名", "行号", "名称", "货品名称"}  # 表头行残留
     def _is_data_row(row):
         name = str(row.get("名称", "")).strip()
@@ -1364,6 +1546,14 @@ def process_single_file(filepath, supplier_name=""):
 
     df = df[df.apply(_is_data_row, axis=1)]
 
+    # df 过滤后 index 可能不连续（跳过了运费/合计等行），
+    # 重建 row_to_header_row 让 key 与当前 df 的连续 index 对齐
+    _new_map = {}
+    for _new_idx, (_old_idx, _) in enumerate(df.iterrows()):
+        if _old_idx in row_to_header_row:
+            _new_map[_new_idx] = row_to_header_row[_old_idx]
+    row_to_header_row = _new_map
+
     # 小小玩具：总金额取整单"成交金额"，仅写入第2行（首条数据行），其余行清空
     if supplier_name == "小小玩具" and deal_amount is not None:
         df["总金额"] = ""
@@ -1381,7 +1571,12 @@ def process_single_file(filepath, supplier_name=""):
     os.makedirs(out_dir, exist_ok=True)
     # 使用原文件名（去掉扩展名），文件名=厂家+原名，统一 .xlsx
     orig_stem = os.path.splitext(os.path.basename(filename))[0]
-    out_basename = f"{safe_supplier}{orig_stem}.xlsx"
+    if supplier_name == "糖果" and candy_fee is not None:
+        # 糖果厂家：文件名=厂家+运费**元+原名
+        fee_str = f"{candy_fee:.0f}" if candy_fee == int(candy_fee) else str(candy_fee)
+        out_basename = f"{safe_supplier}运费{fee_str}元{orig_stem}.xlsx"
+    else:
+        out_basename = f"{safe_supplier}{orig_stem}.xlsx"
     # 文件名中的非法字符替换
     out_basename = re.sub(r'[\\/:*?"<>|]', "_", out_basename)
     output_path = os.path.join(out_dir, out_basename)
