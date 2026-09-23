@@ -265,27 +265,20 @@ def _convert_xls_to_xlsx(src_xls, dst_xlsx):
 
     返回 True 表示成功，False 表示转换失败（调用方应回退到 xlrd 纯数据读取）。
     """
-    import subprocess
-
-    ps_script = (
-        "$ErrorActionPreference='Stop';"
-        "$excel = New-Object -ComObject Excel.Application;"
-        "$excel.Visible = $false;"
-        "$excel.DisplayAlerts = $false;"
-        f"$wb = $excel.Workbooks.Open('{src_xls}');"
-        f"$wb.SaveAs('{dst_xlsx}', 51);"
-        "$wb.Close($false);"
-        "$excel.Quit();"
-        "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null;"
-        "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null;"
-    )
     try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", ps_script],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            return False
+        from win32com.client import Dispatch
+        import pythoncom
+
+        pythoncom.CoInitialize()  # 确保 COM 在当前线程初始化（后台线程也安全）
+        excel = Dispatch('Excel.Application')
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(os.path.abspath(src_xls))
+        wb.SaveAs(os.path.abspath(dst_xlsx), 51)  # 51 = xlOpenXMLWorkbook (.xlsx)
+        wb.Close(False)
+        excel.Quit()
+        pythoncom.CoUninitialize()
+
         return os.path.exists(dst_xlsx)
     except Exception:
         return False
@@ -522,39 +515,34 @@ def _insert_images_with_com(xlsx_path, sheet_name, image_items):
         with open(manifest_path, "w", encoding="utf-8") as fp:
             json.dump(manifest, fp, ensure_ascii=False)
 
-        ps_script = (
-            "$ErrorActionPreference='Stop';"
-            f"$m = Get-Content -Raw -Path '{manifest_path}' -Encoding UTF8 | ConvertFrom-Json;"
-            "$excel = New-Object -ComObject Excel.Application;"
-            "$excel.Visible = $false;"
-            "$excel.DisplayAlerts = $false;"
-            "$wb = $excel.Workbooks.Open($m.file);"
-            "$ws = $wb.Worksheets.Item($m.sheet);"
-            "foreach ($img in $m.images) {"
-            "  $cell = $ws.Cells.Item([int]$img.row, [int]$img.col);"
-            "  $imgSize = 80;"
-            "  $shape = $ws.Shapes.AddPicture($img.path, $false, $true,"
-            "     $cell.Left, $cell.Top, $imgSize, $imgSize);"
-            "  $shape.Placement = 1;"
-            "  $shape.Left = $cell.Left + [Math]::Round(($cell.Width - $imgSize) / 2);"
-            "  $shape.Top = $cell.Top + [Math]::Round(($cell.Height - $imgSize) / 2);"
-            "}"
-            "$wb.Save();"
-            "$wb.Close($true);"
-            "$excel.Quit();"
-            "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($ws) | Out-Null;"
-            "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null;"
-            "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null;"
-        )
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", ps_script],
-            capture_output=True, text=True, timeout=180,
-        )
-        if result.returncode != 0:
-            print(f"    [警告] COM 插图脚本失败: {(result.stderr or result.stdout)[:300]}")
-            return False
-        print(f"    🖼 COM 插入图片 {len(image_items)} 张")
-        return True
+        # 用 Python 原生 win32com 插图（比 PowerShell 干净，不弹黑窗）
+        from win32com.client import Dispatch
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            excel = Dispatch('Excel.Application')
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb = excel.Workbooks.Open(os.path.abspath(xlsx_path))
+            ws = wb.Worksheets(sheet_name)
+            IMG_SIZE = 80
+            for idx, (r, c, _) in enumerate(image_items):
+                cell = ws.Cells.Item(int(r), int(c))
+                img_path = os.path.join(tmp_dir, f"img_{idx}.jpg")
+                shape = ws.Shapes.AddPicture(
+                    os.path.abspath(img_path), False, True,
+                    cell.Left, cell.Top, IMG_SIZE, IMG_SIZE,
+                )
+                shape.Placement = 1  # xlMoveAndSize
+                shape.Left = cell.Left + round((cell.Width - IMG_SIZE) / 2)
+                shape.Top = cell.Top + round((cell.Height - IMG_SIZE) / 2)
+            wb.Save()
+            wb.Close(True)
+            excel.Quit()
+            print(f"    🖼 COM 插入图片 {len(image_items)} 张")
+            return True
+        finally:
+            pythoncom.CoUninitialize()
     except Exception as e:
         print(f"    [警告] COM 插图异常: {e}")
         return False
@@ -881,7 +869,7 @@ def _jjl_classify_spec_tag(name):
 _HS_STATIONERY_KW = [
     "素描本", "磁扣本", "手账本", "套尺", "橡皮檫", "橡皮擦", "画本", "便签",
     "订书机", "马克笔", "笔袋", "削笔机", "削笔刀", "板夹", "中性笔", "笔筒",
-    "圆规", "中性盲盒笔", "线圈本", "套规",
+    "圆规", "中性盲盒笔", "线圈本", "套规", "修正带",
 ]
 _HS_LIVING_KW = ["剪刀", "收纳盒"]
 _HS_TOY_KW = [
@@ -909,8 +897,8 @@ def _hs_classify_spec_tag(name):
     # 规则4：特定货品 → 玩具类/儿童玩具
     if _HS_10X_NAME in name:
         return "玩具类", "儿童玩具"
-    # 规则5：诺-*盲盒 → 玩具类/儿童玩具
-    if re.search(r"诺[-—].*盲盒", name):
+    # 规则5：诺-* → 玩具类/儿童玩具
+    if re.search(r"诺[-—]", name):
         return "玩具类", "儿童玩具"
     # 默认：玩具类/儿童玩具（豪仕主打盲盒玩具）
     return "玩具类", "儿童玩具"
@@ -1093,8 +1081,8 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         spec_multiple = 1
         if _HS_10X_NAME in original_name:
             spec_multiple = 10
-        # 规则5：诺-*盲盒 且 单价>20 → 按48入拆解
-        elif re.search(r"诺[-—].*盲盒", original_name) and price > 20:
+        # 规则5：诺-* 且 单价>20 → 按48入拆解
+        elif re.search(r"诺[-—]", original_name) and price > 20:
             spec_multiple = 48
 
         # 规格/标签按关键词分类
@@ -1607,9 +1595,16 @@ def process_single_file(filepath, supplier_name=""):
     }
 
 
-def process_all():
+def process_all(suppliers=None):
+    """
+    扫描并处理订单表格。
+
+    suppliers: list[str] 或 None。
+        None / [] → 处理全部厂家（向后兼容）。
+        ["糖果", "豪仕"] → 只处理选中的厂家。
+    """
     print("=" * 60)
-    print("步骤 1: 扫描并处理所有订单表格")
+    print("步骤 1: 扫描并处理订单表格")
     print("=" * 60)
 
     files = find_excel_files(INPUT_DIR)
@@ -1618,21 +1613,31 @@ def process_all():
         print(f"  请在该目录下按厂家建子文件夹，并放入厂家给的原始表格")
         return []
 
+    # 过滤：按选中厂家
+    if suppliers:
+        suppliers_set = set(suppliers)
+        files = [(s, f) for s, f in files if s in suppliers_set]
+        if not files:
+            print(f"[警告] 选中的厂家 {list(suppliers)} 没有找到任何表格")
+            return []
+
     print(f"  输入目录: {INPUT_DIR}")
     print(f"  输出目录: {OUTPUT_DIR}")
+    if suppliers:
+        print(f"  选中厂家: {list(suppliers)}")
     print(f"  共发现 {len(files)} 个表格文件")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 处理前先清空输出目录中的旧文件，避免残留
+    # 处理前先清空选中厂家的旧输出目录（不清空全部！）
     import shutil
-    for entry in os.listdir(OUTPUT_DIR):
-        entry_path = os.path.join(OUTPUT_DIR, entry)
-        if os.path.isdir(entry_path):
-            shutil.rmtree(entry_path, ignore_errors=True)
-        elif os.path.isfile(entry_path):
+    touched = set(s for s, _ in files)
+    for supplier in touched:
+        safe = re.sub(r'[\\/:*?"<>|]', "_", supplier)
+        supp_dir = os.path.join(OUTPUT_DIR, safe)
+        if os.path.isdir(supp_dir):
             try:
-                os.remove(entry_path)
+                shutil.rmtree(supp_dir, ignore_errors=True)
             except Exception:
                 pass
 

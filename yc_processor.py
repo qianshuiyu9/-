@@ -143,8 +143,14 @@ def _round_half_up(v, ndigits=2):
     return float(d)
 
 
-def process_yuanchuang_all():
-    """处理所有原创文件，每个文件一个客户，输出一个文件."""
+def process_yuanchuang_all(suppliers=None):
+    """处理所有原创文件，每个文件一个客户，输出一个文件.
+
+    suppliers: list[str] 或 None。若给定且不包含 '原创'，直接返回 [].
+    """
+    if suppliers is not None and "原创" not in suppliers:
+        return []
+
     input_dir = os.path.join(
         os.path.join(os.path.expanduser("~"), "Desktop"),
         "原始数据文件", "原创"

@@ -4,12 +4,17 @@ import os
 from datetime import datetime
 
 # Windows 默认 GBK 控制台无法显示 emoji，强制切 UTF-8
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    try:
+# 注意 --windowed（无控制台）模式下 sys.stdout/sys.stderr 是 None
+try:
+    if sys.stdout is not None and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+try:
+    if sys.stderr is not None and sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
         sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+except Exception:
+    pass
 
 # ⚠️ 先只 import 轻量的 auth（不要碰 numpy/pandas）
 # 在验证通过后才 import excel_processor 等重模块
@@ -127,6 +132,7 @@ def main():
     parser.add_argument("--no-upload", action="store_true", help="仅生成本地表格，不上传")
     parser.add_argument("--headless", action="store_true", help="浏览器无界面模式")
     parser.add_argument("--gen-code", action="store_true", help="[发布者工具] 打印今日验证码后退出")
+    parser.add_argument("--cli", action="store_true", help="命令行模式（不启动 GUI）")
     args = parser.parse_args()
 
     if args.gen_code:
@@ -143,12 +149,23 @@ def main():
         print("=" * 40)
         return
 
-    run(upload=False, headless=args.headless)
+    # 默认启动 GUI；--cli 走原来的命令行流程
+    if not args.cli:
+        try:
+            from gui import launch_gui
+            launch_gui()
+        except Exception as e:
+            print(f"[GUI 启动失败，回退命令行] {e}")
+            run(upload=False, headless=args.headless)
+    else:
+        run(upload=False, headless=args.headless)
 
 
 if __name__ == "__main__":
     main()
-    try:
-        input("\n按回车键退出...")
-    except (EOFError, KeyboardInterrupt):
-        pass
+    # GUI 模式退出后不阻塞；CLI 模式保留回车暂停
+    if "--cli" in sys.argv or "--gen-code" in sys.argv:
+        try:
+            input("\n按回车键退出...")
+        except (EOFError, KeyboardInterrupt):
+            pass
