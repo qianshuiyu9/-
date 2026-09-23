@@ -79,18 +79,30 @@ def _yc_clean_display_name(name):
 
 
 def _yc_classify_spec_tag(category):
-    """根据商品分类值判断规格和标签."""
+    """根据商品分类值判断规格和标签.
+
+    匹配顺序（三层优先级）：
+      1. toy_exact — 玩具精确词（棋盘/扑克牌等，两字以上，不会和硬分类冲突）
+      2. 硬分类    — 水杯 → 餐具(含盘) → 数码 → 挂件 → 箱包
+      3. toy_fallback — 玩具泛词兜底
+      4. 默认生活类/生活用品
+    """
     cat = str(category).strip()
-    toy_kws = ["玩具", "盲盒", "公仔", "毛绒", "娃娃", "积木"]
-    for kw in toy_kws:
+
+    # --- 第 1 层：玩具精确词（两字以上完整词，不会和硬分类冲突）---
+    toy_exact = ["棋盘", "象棋", "飞行棋", "斗兽棋", "军棋", "围棋", "跳棋",
+                 "五子棋", "大富翁", "扑克牌", "卡牌", "纸牌"]
+    for kw in toy_exact:
         if kw in cat:
             return "玩具类", "儿童玩具"
 
+    # --- 第 2 层：硬分类 ---
     cup_kws = ["陶瓷杯", "玻璃杯", "马克杯", "保温杯", "水杯", "杯"]
     tableware_kws = ["陶瓷碗", "餐具", "泡面碗", "碗盘", "碗", "盘", "碟", "筷", "勺"]
     digital_kws = ["数码", "充电", "耳机", "音箱", "数据线"]
     bag_kws = ["时尚小包", "手提包", "包包", "皮包", "包", "袋", "箱"]
     pendant_kws = ["挂件", "挂饰"]
+    decor_kws = ["水晶球"]
 
     for kw in cup_kws:
         if kw in cat:
@@ -104,9 +116,18 @@ def _yc_classify_spec_tag(category):
     for kw in pendant_kws:
         if kw in cat:
             return "生活类", "挂件"
+    for kw in decor_kws:
+        if kw in cat:
+            return "生活类", "摆件"
     for kw in bag_kws:
         if kw in cat:
             return "生活类", "箱包"
+
+    # --- 第 3 层：玩具泛词兜底 ---
+    toy_fallback = ["玩具", "盲盒", "公仔", "娃娃", "积木", "棋", "游戏"]
+    for kw in toy_fallback:
+        if kw in cat:
+            return "玩具类", "儿童玩具"
 
     return "生活类", "生活用品"
 
