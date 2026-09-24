@@ -603,6 +603,13 @@ def read_with_images(filepath):
     header_row_idx, headers = _find_header_row(wb)
     img_map = _read_images_from_wb(wb)
 
+    # wb 关闭前把 Image 对象的 bytes 读出来（关了之后 _data() 会崩）
+    for k, v in list(img_map.items()):
+        try:
+            img_map[k] = v._data() if hasattr(v, '_data') else v
+        except Exception:
+            pass  # 读不出来就算了
+
     df = pd.read_excel(filepath, header=header_row_idx - 1, dtype=object)
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how="all")
@@ -1653,6 +1660,9 @@ def process_single_file(filepath, supplier_name=""):
 
     _write_output_with_images(df, img_map, row_to_header_row, output_path)
 
+    # ===== 油菜花特殊客户：刘斌(70550002)、胡欣茹(70550003) =====
+    _write_ycjh_if_needed(df, img_map, row_to_header_row, safe_supplier, store_name, orig_stem, out_dir)
+
     print(f"    ✓ 输出: {out_basename}  ({original_rows} → {len(df)} 条)")
     if spec_change_count > 0:
         print(f"    🔧 规格拆解: {spec_change_count} 行")
@@ -1675,6 +1685,169 @@ def process_single_file(filepath, supplier_name=""):
         "unmatched_cols": unmatched,
         "image_count": len(img_map) if img_map else 0,
     }
+
+
+# ===== 油菜花（刘斌 / 胡欣茹）特殊导出 =====
+_YCJH_TEMPLATES = {
+    "purchase": r"G:\桌面\油菜花录入\总部采购单模板.xlsx",
+    "retail":   r"G:\桌面\油菜花录入\总部-零售商品资料导入模板.xlsx",
+}
+_YCJH_STORE_CODE = {
+    "刘斌": "70550002",
+    "胡欣茹": "70550003",
+}
+
+
+def _write_ycjh_if_needed(df, img_map, row_to_header_row, supplier, store_name, orig_stem, out_dir):
+    """如果店名包含刘斌/胡欣茹，则再输出油菜花模板文件（零售+采购单）。"""
+    matched = None
+    for name in ("刘斌", "胡欣茹"):
+        if name in store_name:
+            matched = name
+            break
+    if matched is None:
+        return
+
+    yc_dir = os.path.join(out_dir, "油菜花文件")
+    os.makedirs(yc_dir, exist_ok=True)
+    store_code = _YCJH_STORE_CODE[matched]
+    safe_stem = re.sub(r'[\\/:*?"<>|]', "_", orig_stem)
+
+    # --- 1. 零售商品资料导入表 ---
+    _write_ycjh_retail(df, img_map, row_to_header_row, supplier, yc_dir, supplier, safe_stem)
+
+    # --- 2. 采购单 ---
+    _write_ycjh_purchase(df, img_map, supplier, store_code, yc_dir, supplier, safe_stem)
+
+    print(f"    🌸 油菜花: {matched}({store_code}) → {yc_dir}")
+
+
+def _write_ycjh_retail(df, img_map, row_to_header_row, supplier, out_dir, supp_stem, orig_stem):
+    """零售商品资料导入表：按模板填空。"""
+    tpl = _YCJH_TEMPLATES["retail"]
+    out_path = os.path.join(out_dir, f"{supp_stem}零售商品{orig_stem}.xlsx")
+    wb = load_workbook(tpl)
+    ws = wb["商品资料导入模板"]
+
+    # 模板行2是表头，从行3开始填数据
+    header_row = 2
+    # 清掉模板里的示例数据行
+    if ws.max_row > header_row:
+        ws.delete_rows(header_row + 1, ws.max_row - header_row)
+    headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+
+    # 列名 → 列索引（1-based）
+    def col_idx(kw):
+        for i, h in enumerate(headers, 1):
+            if kw in h:
+                return i
+        return None
+
+    col_product     = col_idx("商品名称")       # 货品名称
+    col_category    = col_idx("商品分类")       # 规格（生活类/玩具类/芭比…）
+    col_price       = col_idx("售价")           # 单价*3.5
+    col_real_item   = col_idx("是否实物商品")   # 是
+    col_unit        = col_idx("单位")           # 个
+    col_supplier    = col_idx("供应商")         # 厂家
+    col_lottery     = col_idx("彩票兑换数量")   # 售价*100 整数
+    col_doll        = col_idx("娃娃兑换数量")   # 单价*0.6 整数
+    col_xcx         = col_idx("小程序兑换")     # 否
+    col_first_cost  = col_idx("首次采购价")     # 单价
+    col_store_cost  = col_idx("门店成本价")     # 单价
+    col_attr        = col_idx("商品属性")       # 实物商品
+    col_image       = col_idx("商品图片")       # 图片
+
+    r = header_row + 1
+    for df_idx, (_, row) in enumerate(df.iterrows()):
+        product = str(row.get("名称", row.get("商品名称", ""))).strip()
+        category = str(row.get("规格", "")).strip()   # 数据处理后的规格
+        price = float(row.get("单价", 0))
+        sale_price = round(price * 3.5, 2)
+        lottery_qty = int(round(sale_price * 100))
+        doll_qty = int(round(price * 0.6))
+
+        if col_product:   ws.cell(r, col_product, product)
+        if col_category:  ws.cell(r, col_category, category)
+        if col_price:     ws.cell(r, col_price, sale_price)
+        if col_real_item: ws.cell(r, col_real_item, "是")
+        if col_unit:      ws.cell(r, col_unit, "个")
+        if col_supplier:  ws.cell(r, col_supplier, supplier)
+        if col_lottery:   ws.cell(r, col_lottery, lottery_qty)
+        if col_doll:      ws.cell(r, col_doll, doll_qty)
+        if col_xcx:       ws.cell(r, col_xcx, "否")
+        if col_first_cost: ws.cell(r, col_first_cost, price)
+        if col_store_cost: ws.cell(r, col_store_cost, price)
+        if col_attr:      ws.cell(r, col_attr, "实物商品")
+
+        # 图片：df_idx → 原始 Excel 行号 → img_map（值是 bytes）
+        if col_image and img_map and row_to_header_row:
+            orig_row = row_to_header_row.get(df_idx)
+            if orig_row is not None and orig_row in img_map:
+                try:
+                    raw = img_map[orig_row]
+                    raw = raw._data() if hasattr(raw, '_data') else raw
+                    if isinstance(raw, bytes) and len(raw) > 0:
+                        from openpyxl.drawing.image import Image as XLImage
+                        xl_img = XLImage(io.BytesIO(raw))
+                        xl_img.width = 60
+                        xl_img.height = 60
+                        ws.add_image(xl_img, ws.cell(r, col_image).coordinate)
+                except Exception:
+                    pass
+
+        r += 1
+
+    wb.save(out_path)
+
+
+def _write_ycjh_purchase(df, img_map, supplier, store_code, out_dir, supp_stem, orig_stem):
+    """采购单：按模板填空。"""
+    tpl = _YCJH_TEMPLATES["purchase"]
+    out_path = os.path.join(out_dir, f"{supp_stem}采购单{orig_stem}.xlsx")
+    wb = load_workbook(tpl)
+    ws = wb.active
+
+    # 清掉模板里的示例数据行
+    header_row = 1
+    if ws.max_row > header_row:
+        ws.delete_rows(header_row + 1, ws.max_row - header_row)
+    # 行1表头
+    headers = [str(ws.cell(1, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+
+    def col_idx(kw):
+        for i, h in enumerate(headers, 1):
+            if kw in h:
+                return i
+        return None
+
+    col_store   = col_idx("门店编号")    # 70550002/70550003
+    col_supplier = col_idx("供应商")    # 厂家
+    # *商品编号/名称 vs 商品名称：前者含"*商品编号"，后者只是"商品名称"
+    col_prod = None
+    for i, h in enumerate(headers, 1):
+        if h.startswith("*") and "商品编号" in h:
+            col_prod = i
+            break
+    col_qty     = col_idx("数量")       # 数量
+    col_price   = col_idx("*单价")      # 单价（用*单价更精确，避免匹配入库单价）
+    col_inprice = col_idx("入库单价")   # 单价
+
+    r = 2
+    for _, row in df.iterrows():
+        product = str(row.get("名称", row.get("商品名称", ""))).strip()
+        qty = row.get("进货数量", 1)
+        price = float(row.get("单价", 0))
+
+        if col_store:    ws.cell(r, col_store, store_code)
+        if col_supplier: ws.cell(r, col_supplier, supplier)
+        if col_prod:     ws.cell(r, col_prod, product)
+        if col_qty:      ws.cell(r, col_qty, qty)
+        if col_price:    ws.cell(r, col_price, price)
+        if col_inprice:  ws.cell(r, col_inprice, price)
+
+        r += 1
+
+    wb.save(out_path)
 
 
 def process_all(suppliers=None):
