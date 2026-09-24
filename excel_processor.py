@@ -663,6 +663,9 @@ def map_columns(df, supplier_name=""):
     keep = list(TARGET_COLUMNS)
     if "_备注" in df.columns:
         keep.append("_备注")
+    # 序号列（如果存在）保留作过滤辅助，不输出
+    if "序号" in df.columns:
+        keep.append("序号")
     df = df[keep]
 
     mapped = [c for c in rename_map.values()]
@@ -966,10 +969,12 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         display_name = _clean_display_name(cleaned_name)
 
         # 数量 × 倍数，单价 ÷ 倍数
+        spec_changed = False
         if spec_multiple > 1 and qty > 0:
             qty = qty * spec_multiple
             if price > 0:
                 price = _round_half_up(price / spec_multiple, 2)
+            spec_changed = True
 
         # 规格/标签按名称关键词分类
         spec_val, tag_val = _jjl_classify_spec_tag(original_name)
@@ -984,6 +989,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["单价"] = price if price != 0 else ""
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["_needs_review"] = False
+        row["_spec_changed"] = spec_changed
         return row
 
     # ===== 鸿达厂家专属逻辑 =====
@@ -1003,6 +1009,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
             row["单价"] = price if price != 0 else ""
             row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
             row["_needs_review"] = False
+            row["_spec_changed"] = False
             return row
 
         # 从名称中提取"N入"倍数
@@ -1015,10 +1022,12 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
 
         display_name = _clean_display_name(cleaned_name)
 
+        spec_changed = False
         if spec_multiple > 1 and qty > 0:
             qty = qty * spec_multiple
             if price > 0:
                 price = _round_half_up(price / spec_multiple, 2)
+            spec_changed = True
 
         row["名称"] = original_name
         row["展示名"] = display_name if display_name else original_name
@@ -1030,6 +1039,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["单价"] = price if price != 0 else ""
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["_needs_review"] = False
+        row["_spec_changed"] = spec_changed
         return row
 
     # ===== 小小玩具厂家专属逻辑 =====
@@ -1072,6 +1082,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["条码"] = ""  # 条码列不填
         row["_needs_review"] = False
+        row["_spec_changed"] = False
         return row
 
     # ===== 豪仕厂家专属逻辑 =====
@@ -1097,10 +1108,12 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         display_name = _clean_display_name(cleaned_name)
 
         # 数量 × 倍数，单价 ÷ 倍数
+        spec_changed = False
         if spec_multiple > 1 and qty > 0:
             qty = qty * spec_multiple
             if price > 0:
                 price = _round_half_up(price / spec_multiple, 2)
+            spec_changed = True
 
         row["名称"] = original_name
         row["展示名"] = display_name if display_name else original_name
@@ -1112,6 +1125,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["单价"] = price if price != 0 else ""
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["_needs_review"] = False
+        row["_spec_changed"] = spec_changed
         return row
 
     # ===== 糖果厂家专属规格/标签逻辑 =====
@@ -1155,6 +1169,60 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["单价"] = price if price != 0 else ""
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         row["_needs_review"] = False
+        row["_spec_changed"] = False
+        return row
+
+    # ===== 多乐厂家专属规则 =====
+    if supplier_name == "多乐":
+        # 多乐不做规格拆解，标签固定公仔
+        name = original_name
+
+        # 规则1（最高优先级）：从名称提取尺寸（厘米/cm，大小写不敏感）
+        # 例: "LL  30厘米不爽猫", "YMWJ  20cm白兔田园系列-蘑菇", "SY  22厘米铃铛小羊"
+        size_nums = re.findall(r"(\d+(?:\.\d+)?)\s*(?:厘米|cm)", name, re.IGNORECASE)
+        has_size = bool(size_nums)
+        size_val = float(max(float(n) for n in size_nums)) if has_size else None
+
+        if has_size:
+            # 先判断尺寸>50 且 单价>=50 → 超牛
+            if size_val > 50 and price >= 50:
+                spec_val = "超牛（80cm）"
+            elif size_val < 20:
+                spec_val = "芭比（5-10cm）"
+            elif size_val <= 25:
+                spec_val = "7寸（20cm）"
+            else:  # 25 < size_val <= 50
+                spec_val = "12-18寸（40-50cm）"
+        else:
+            # 规则2：无尺寸，但有关键词（不区分大小写，字母关键词忽略大小写）
+            _dl_kw_cn = ["豆袋", "挂件", "桌伴", "磁吸", "掌中宝"]
+            _dl_kw_letters = ["jnsp", "rhsp", "cdw", "lwj"]
+            name_lower = name.lower()
+            has_kw = any(kw in name for kw in _dl_kw_cn) or any(kw in name_lower for kw in _dl_kw_letters)
+
+            if has_kw:
+                spec_val = "芭比（5-10cm）"
+            elif "精品" in name:
+                # 规则3：含"精品"（低于规则1和2）
+                if price < 20:
+                    spec_val = "7寸（20cm）"
+                else:
+                    spec_val = "12-18寸（40-50cm）"
+            else:
+                # 规则4（默认）：12-18寸
+                spec_val = "12-18寸（40-50cm）"
+
+        row["名称"] = original_name
+        row["展示名"] = original_name  # 多乐展示名不清理
+        row["规格"] = spec_val
+        row["用途"] = "礼品机,兑换,零售"
+        row["标签"] = "公仔"
+        row["单位"] = "只"
+        row["进货数量"] = qty if qty != 0 else ""
+        row["单价"] = price if price != 0 else ""
+        row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
+        row["_needs_review"] = False
+        row["_spec_changed"] = False
         return row
 
     # ===== 其他厂家（成龙、辉鸿等）通用逻辑 =====
@@ -1168,6 +1236,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
         # 跳过规格拆解（故意不拆，无需复核），但展示名仍需清理
         row["_needs_review"] = False
+        row["_spec_changed"] = False
         row["展示名"] = _clean_display_name(original_name)
         return row
 
@@ -1208,10 +1277,12 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         display_name = "⚠" + display_name
 
     # 数量 × 倍数，单价 ÷ 倍数（四舍五入到2位小数）
+    spec_changed = False
     if spec_multiple > 1 and qty > 0:
         qty = qty * spec_multiple
         if price > 0:
             price = _round_half_up(price / spec_multiple, 2)
+        spec_changed = True
 
     row["名称"] = original_name
     row["展示名"] = display_name if display_name else original_name
@@ -1223,6 +1294,8 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
     row["进货数量"] = qty if qty != 0 else ""
     row["单价"] = price if price != 0 else ""
     row["积分倍数"] = FIXED_INTEGRAL_MULTIPLIER
+    row["_needs_review"] = needs_review
+    row["_spec_changed"] = spec_changed
 
     return row
 
@@ -1481,9 +1554,10 @@ def process_single_file(filepath, supplier_name=""):
         name = str(row.get("名称", ""))
         if _has_skip_keyword(name):
             skip_count += 1
-        elif re.search(SPEC_REGEX, name):
-            spec_change_count += 1
         result = parse_spec_and_recalc(row, supplier_name=supplier_name, deal_amount=deal_amount)
+        # spec_change_count 基于实际拆解（parse_spec_and_recalc 内真的改了数量单价）
+        if result.get("_spec_changed"):
+            spec_change_count += 1
         if result.get("_needs_review"):
             review_items.append(str(result.get("名称", "")))
         return result
@@ -1516,6 +1590,11 @@ def process_single_file(filepath, supplier_name=""):
     _non_data_keywords = ["合计", "欠款", "注：", "注:", "本次成交", "上次欠款", "运费"]
     _header_residue = {"商品全名", "行号", "名称", "货品名称"}  # 表头行残留
     def _is_data_row(row):
+        # 序号列存在 → 必须是纯数字（商品行序号是 1,2,3...）
+        seq = str(row.get("序号", "")).strip()
+        if seq and not seq.replace('.', '').isdigit():
+            return False
+        # 序号列叫"名称"也检查
         name = str(row.get("名称", "")).strip()
         if not name:
             return False
@@ -1548,9 +1627,12 @@ def process_single_file(filepath, supplier_name=""):
         if len(df) > 0:
             df.loc[df.index[0], "总金额"] = deal_amount
 
-    # 豪仕：不输出总金额列
-    if supplier_name == "豪仕":
+    # 豪仕 / 多乐：不输出总金额列
+    if supplier_name in ("豪仕", "多乐"):
         df = df.drop(columns=["总金额"], errors="ignore")
+
+    # 序号列是内部过滤辅助列，不输出
+    df = df.drop(columns=["序号"], errors="ignore")
 
     # 输出目录：OUTPUT_DIR/{厂家名}/  文件名：使用原表格名称
     store_name = extract_store_name(filename, supplier_name)
