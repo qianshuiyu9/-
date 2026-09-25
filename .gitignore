@@ -10,6 +10,16 @@ build/
 .venv/
 venv/
 
+# Playwright browsers (local)
+.pw-browsers/
+
+# Local agent skills (installed via skills CLI)
+.agents/
+.claude/
+.trae/
+agent/
+skills-lock.json
+
 # IDE
 .vscode/
 .idea/
