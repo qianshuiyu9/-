@@ -57,16 +57,20 @@ def _parse_yc_file(filepath):
 
 
 def _yc_clean_display_name(name):
-    """原创展示名清理：去掉尾部的 (N/箱)、规格括号等."""
-    # 去掉尾部 (N/箱)、（N/箱）、(N/盒) 等
+    """原创展示名清理：去掉整盒说明、(N/箱)规格括号等."""
+    # 0) 去掉任意位置的"整盒"说明括号（最优先）
+    name = re.sub(r"[（(]\s*整盒[^（）()]*[）)]", "", name)
+
+    # 1) 去掉任意位置的 (N/箱)、(N/盒)、(N入) 规格括号（不再只限尾部）
     for _ in range(3):
         prev = name
-        name = re.sub(r"\s*[（(]\s*\d+\s*/\s*箱\s*[）)]\s*$", "", name)
-        name = re.sub(r"\s*[（(]\s*\d+\s*/\s*盒\s*[）)]\s*$", "", name)
+        name = re.sub(r"\s*[（(]\s*\d+\s*/\s*箱\s*[）)]", "", name)
+        name = re.sub(r"\s*[（(]\s*\d+\s*/\s*盒\s*[）)]", "", name)
+        name = re.sub(r"\s*[（(]\s*\d+\s*入\s*[）)]", "", name)
         if name == prev:
             break
 
-    # 去掉尾部其他括号组（含完整/半角括号）
+    # 2) 去掉尾部其他括号组（品牌/系列括号：如"（蘑菇兔）"保留内容，空括号去掉）
     for _ in range(3):
         prev = name
         name = re.sub(r"\s*[（(].*?[）)]\s*$", "", name)

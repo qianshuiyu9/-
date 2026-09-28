@@ -260,28 +260,71 @@ def _find_header_row_pandas(raw_df):
     return 1, [str(v) for v in raw_df.iloc[0].tolist()]
 
 
+def _launch_isolated_excel():
+    """启动独立的 Excel 进程，与用户已开的 Excel 完全隔离。
+
+    返回 (excel_com_obj, subprocess_handle)。用完后先 excel.Quit()，再 proc.terminate() 兜底。
+    """
+    import subprocess, time, winreg
+
+    # 从注册表找 Excel 可执行路径
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\excel.exe")
+        excel_path, _ = winreg.QueryValueEx(key, "")
+    except Exception:
+        excel_path = "EXCEL.EXE"
+
+    # subprocess 启动独立实例（/e 隐藏启动不创建空白工作簿，/embedding 不显示启动画面）
+    proc = subprocess.Popen(
+        [excel_path, "/e", "/embedding"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    time.sleep(3)  # 等 Excel 完全启动并注册到 ROT
+
+    from win32com.client import Dispatch
+    import pythoncom
+    pythoncom.CoInitialize()
+
+    excel = Dispatch("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    return excel, proc
+
+
 def _convert_xls_to_xlsx(src_xls, dst_xlsx):
     """通过 Excel COM 将 .xls 转换为 .xlsx（保留图片）。
 
     返回 True 表示成功，False 表示转换失败（调用方应回退到 xlrd 纯数据读取）。
+    不会干扰用户已打开的 Excel。
     """
+    excel = None
+    proc = None
+    result = False
     try:
-        from win32com.client import Dispatch
-        import pythoncom
-
-        pythoncom.CoInitialize()  # 确保 COM 在当前线程初始化（后台线程也安全）
-        excel = Dispatch('Excel.Application')
-        excel.Visible = False
-        excel.DisplayAlerts = False
+        excel, proc = _launch_isolated_excel()
         wb = excel.Workbooks.Open(os.path.abspath(src_xls))
         wb.SaveAs(os.path.abspath(dst_xlsx), 51)  # 51 = xlOpenXMLWorkbook (.xlsx)
         wb.Close(False)
-        excel.Quit()
-        pythoncom.CoUninitialize()
-
-        return os.path.exists(dst_xlsx)
+        result = os.path.exists(dst_xlsx)  # 先判断再 Quit
     except Exception:
-        return False
+        result = False
+    finally:
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+        try:
+            if proc is not None:
+                proc.terminate()
+        except Exception:
+            pass
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+    return result
 
 
 def _extract_images_via_com(filepath, header_row_idx):
@@ -289,19 +332,18 @@ def _extract_images_via_com(filepath, header_row_idx):
 
     适用于 openpyxl 读不到的图片格式（如 WMF/EMF）。
     返回 {excel_row_1based: jpeg_bytes, ...}。
+    不会干扰用户已打开的 Excel。
     """
     import tempfile as _tmp
-    import subprocess as _sp
-    from win32com.client import Dispatch
 
     tmp_dir = os.path.join(_tmp.gettempdir(), "_candy_imgs_" + str(os.getpid()))
     os.makedirs(tmp_dir, exist_ok=True)
 
     img_map = {}
+    excel = None
+    proc = None
     try:
-        excel = Dispatch('Excel.Application')
-        excel.Visible = False
-        excel.DisplayAlerts = False
+        excel, proc = _launch_isolated_excel()
         wb = excel.Workbooks.Open(os.path.abspath(filepath))
         ws = wb.ActiveSheet
 
@@ -365,10 +407,19 @@ def _extract_images_via_com(filepath, header_row_idx):
 
         wb.Close(False)
         excel.Quit()
+        excel = None
+        if proc:
+            proc.terminate()
     except Exception as e:
         print(f"    [警告] COM 图片提取失败: {e}")
         try:
-            excel.Quit()
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+        try:
+            if proc is not None:
+                proc.terminate()
         except Exception:
             pass
     finally:
@@ -515,14 +566,11 @@ def _insert_images_with_com(xlsx_path, sheet_name, image_items):
         with open(manifest_path, "w", encoding="utf-8") as fp:
             json.dump(manifest, fp, ensure_ascii=False)
 
-        # 用 Python 原生 win32com 插图（比 PowerShell 干净，不弹黑窗）
-        from win32com.client import Dispatch
-        import pythoncom
-        pythoncom.CoInitialize()
+        # 用独立 Excel 实例插图（不影响用户已开的 Excel）
+        excel = None
+        proc = None
         try:
-            excel = Dispatch('Excel.Application')
-            excel.Visible = False
-            excel.DisplayAlerts = False
+            excel, proc = _launch_isolated_excel()
             wb = excel.Workbooks.Open(os.path.abspath(xlsx_path))
             ws = wb.Worksheets(sheet_name)
             IMG_SIZE = 80
@@ -539,13 +587,24 @@ def _insert_images_with_com(xlsx_path, sheet_name, image_items):
             wb.Save()
             wb.Close(True)
             excel.Quit()
+            excel = None
+            if proc:
+                proc.terminate()
             print(f"    🖼 COM 插入图片 {len(image_items)} 张")
             return True
-        finally:
-            pythoncom.CoUninitialize()
-    except Exception as e:
-        print(f"    [警告] COM 插图异常: {e}")
-        return False
+        except Exception as e:
+            print(f"    [警告] COM 插图异常: {e}")
+            try:
+                if excel is not None:
+                    excel.Quit()
+            except Exception:
+                pass
+            try:
+                if proc is not None:
+                    proc.terminate()
+            except Exception:
+                pass
+            return False
     finally:
         try:
             import shutil
@@ -754,8 +813,11 @@ def _clean_display_name(name):
       - 价格：如 "1元"、"(5元)"、"(2元)"
       - 后缀编码：如 "(8833)"
       - 中文数字规格片段：如 "五入"、"十入"
+      - "整盒"说明括号：如 "（整盒出9个装）"、"(整盒出30个装)"、"（整盒出24个装）"
       - 残留的"装/裝"、连接符、标点、多余括号与空白
     """
+    # 0) 移除任意位置的"整盒"说明括号（最优先，避免后续规则误处理）
+    name = re.sub(r"[（(]\s*整盒[^（）()]*[）)]", "", name)
     # 半角/全角括号统一处理
     # 1) 去掉开头的注释词（不退换等），无论是否带括号，并去掉紧随其后的编码括号
     for note in _NAME_NOTE_PREFIXES:
@@ -784,15 +846,16 @@ def _clean_display_name(name):
     name = re.sub(r"\d+(?:\.\d+)?\s*元", "", name)
     name = re.sub(r"(?:建议)?零售价?", "", name)
 
-    # 4) 去掉末尾括号包裹的编码、价格或规格（如 "(168-48)"、"(2元)"、"(24入)"、"(16件/件)"、"(60/件)"）
-    name = re.sub(r"\s*[（(][A-Za-z0-9\-\.]+[）)]\s*$", "", name)
-    name = re.sub(r"\s*[（(]\s*\d+(?:\.\d+)?\s*元\s*[）)]\s*$", "", name)
-    # 末尾括号内为"数字+规格单位"的规格片段（如"(24入)"、"(6个)"、"(16件/件)"、"(60/件)"、"(192/件16/盒)"、"(108/件 12/盒)"）
-    _spec_unit_alt = "|".join(["入", "支", "个", "包", "袋", "盒", "板", "瓶", "罐", "条", "片", "粒", "颗", "张", "本", "件", "中包"])
-    # 匹配模式：数字后可选单位，后可跟多组(/数字单位 或 /单位)（如 192/件16/盒、108/件 12/盒、60/件）
+    # 4) 去掉括号包裹的编码、价格或规格（如 "(168-48)"、"(2元)"、"(24入)"、"(16件/件)"、"(60/件)"、"(36/箱)"）
+    #    去掉 $ 锚定，让它匹配任意位置的规格块（不只是末尾）
+    name = re.sub(r"\s*[（(][A-Za-z0-9\-\.]+[）)]\s*(?![A-Za-z\u4e00-\u9fff])", " ", name)
+    name = re.sub(r"\s*[（(]\s*\d+(?:\.\d+)?\s*元\s*[）)]\s*", " ", name)
+    # 括号内为"数字+规格单位"的规格片段（如"(24入)"、"(6个)"、"(16件/件)"、"(60/件)"、"(192/件16/盒)"、"(108/件 12/盒)"、"(36/箱)"、"(72/箱)"）
+    _spec_unit_alt = "|".join(["入", "支", "个", "包", "袋", "盒", "板", "瓶", "罐", "条", "片", "粒", "颗", "张", "本", "件", "中包", "箱"])
+    # 匹配模式：数字后可选单位，后可跟多组(/数字单位 或 /单位)（如 192/件16/盒、108/件 12/盒、60/件、36/箱）
     _spec_content = r"\d+(?:\.\d+)?\s*(?:" + _spec_unit_alt + r")?[装裝]?" \
                     r"(?:\s*[/／]?\s*\d*\s*(?:" + _spec_unit_alt + r")?[装裝]?)*"
-    name = re.sub(r"\s*[（(]\s*" + _spec_content + r"\s*[）)]\s*$", "", name)
+    name = re.sub(r"\s*[（(]\s*" + _spec_content + r"\s*[）)]\s*", " ", name)
 
     # 5) 清理残留的空括号 "()" "（）" 及零散的多余括号
     name = re.sub(r"[（(]\s*[）)]", "", name)
