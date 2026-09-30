@@ -38,13 +38,21 @@ def _parse_yc_file(filepath):
 
         wb = load_workbook(xlsx_path)
         wb_img_map = _read_images_from_wb(wb)
+
+        # wb close 之前把 openpyxl Image 对象转成纯 bytes，否则 wb.close() 后 _data() 失效
+        img_map_raw = {}
+        for opxl_row, img_obj in wb_img_map.items():
+            try:
+                img_map_raw[opxl_row] = img_obj._data() if hasattr(img_obj, '_data') else img_obj
+            except Exception:
+                pass
         wb.close()
 
         img_map = {}
-        for opxl_row, img_obj in wb_img_map.items():
+        for opxl_row, raw_bytes in img_map_raw.items():
             pd_idx = opxl_row - 5
             if 0 <= pd_idx < len(df):
-                img_map[opxl_row] = img_obj
+                img_map[opxl_row] = raw_bytes
 
         return {"客户名": customer_name, "df": df, "img_map": img_map}
 
@@ -82,16 +90,22 @@ def _yc_clean_display_name(name):
     return name.strip()
 
 
-def _yc_classify_spec_tag(category):
-    """根据商品分类值判断规格和标签.
+def _yc_classify_spec_tag(category, name=""):
+    """根据商品分类值和商品名称判断规格和标签.
 
     匹配顺序（三层优先级）：
       1. toy_exact — 玩具精确词（棋盘/扑克牌等，两字以上，不会和硬分类冲突）
-      2. 硬分类    — 水杯 → 餐具(含盘) → 数码 → 挂件 → 箱包
+      2. 硬分类    — 水杯 → 餐具(含盘) → 挂件 → 数码 → 箱包
       3. toy_fallback — 玩具泛词兜底
       4. 默认生活类/生活用品
+
+    说明：分类列常是系列名（如"萌宠系列""卡皮巴拉系列"），无法反映货品功能，
+    因此硬分类同时匹配商品名称。name 传清洗后的展示名（已去掉 (N/箱) 等
+    包装说明），避免"箱/包"等包装词误命中箱包。
     """
     cat = str(category).strip()
+    nm = str(name or "").strip()
+    text = (cat + " " + nm).strip()
 
     # --- 第 1 层：玩具精确词（两字以上完整词，不会和硬分类冲突）---
     toy_exact = ["棋盘", "象棋", "飞行棋", "斗兽棋", "军棋", "围棋", "跳棋",
@@ -103,28 +117,28 @@ def _yc_classify_spec_tag(category):
     # --- 第 2 层：硬分类 ---
     cup_kws = ["陶瓷杯", "玻璃杯", "马克杯", "保温杯", "水杯", "杯"]
     tableware_kws = ["陶瓷碗", "餐具", "泡面碗", "碗盘", "碗", "盘", "碟", "筷", "勺"]
+    pendant_kws = ["公仔扣", "钥匙扣", "挂件", "挂饰"]
     digital_kws = ["数码", "充电", "耳机", "音箱", "数据线"]
     bag_kws = ["时尚小包", "手提包", "包包", "皮包", "包", "袋", "箱"]
-    pendant_kws = ["挂件", "挂饰"]
     decor_kws = ["水晶球"]
 
     for kw in cup_kws:
-        if kw in cat:
+        if kw in text:
             return "生活类", "水杯"
     for kw in tableware_kws:
-        if kw in cat:
+        if kw in text:
             return "生活类", "餐具"
-    for kw in digital_kws:
-        if kw in cat:
-            return "生活类", "数码"
     for kw in pendant_kws:
-        if kw in cat:
+        if kw in text:
             return "生活类", "挂件"
+    for kw in digital_kws:
+        if kw in text:
+            return "生活类", "数码"
     for kw in decor_kws:
-        if kw in cat:
+        if kw in text:
             return "生活类", "摆件"
     for kw in bag_kws:
-        if kw in cat:
+        if kw in text:
             return "生活类", "箱包"
 
     # --- 第 3 层：玩具泛词兜底 ---
@@ -226,9 +240,14 @@ def process_yuanchuang_all(suppliers=None):
 
             category = str(row.get("商品分类", "")).strip()
 
-            # 数量、单价、金额
+            # 数量、单价、金额（价格以"折后单价"为准，原"单价"列数据有误）
             qty_v = row.get("数量")
-            price_v = row.get("单价")
+            price_v = row.get("折后单价")
+            try:
+                if pd.isna(price_v) or str(price_v).strip() in ("", "nan", "None"):
+                    price_v = row.get("单价")   # 兜底：折后单价为空时退回原单价
+            except (TypeError, ValueError):
+                pass
             amount_v = row.get("金额")
             try:
                 qty = float(qty_v) if pd.notna(qty_v) and str(qty_v).strip() not in ("", "nan") else 0
@@ -270,7 +289,7 @@ def process_yuanchuang_all(suppliers=None):
                 new_price = price
 
             display_name = _yc_clean_display_name(name)
-            spec_val, tag_val = _yc_classify_spec_tag(category)
+            spec_val, tag_val = _yc_classify_spec_tag(category, display_name)
 
             rows_data.append(({
                 "类别": category,               # 商品分类原始值（皮包系列、碗盘组合类等）
@@ -314,14 +333,18 @@ def process_yuanchuang_all(suppliers=None):
         safe_cust = re.sub(r"[\\/:*?\"<>|\n\r\t]+", "_", cust).strip()
         out_name = f"原创{safe_cust}.xlsx"
         out_path = os.path.join(out_dir, out_name)
+        orig_stem = os.path.splitext(os.path.basename(fp))[0]
 
-        from excel_processor import _write_output_with_images
+        from excel_processor import _write_output_with_images, _write_ycjh_if_needed
 
         row_to_header_row = {}
         for out_i, pd_i in enumerate(orig_indices):
             row_to_header_row[out_i] = pd_i + 5
 
         _write_output_with_images(out_df, img_map, row_to_header_row, out_path)
+
+        # 油菜花：原创管线也处理刘斌/胡欣茹
+        _write_ycjh_if_needed(out_df, img_map, row_to_header_row, "原创", cust, orig_stem, out_dir)
 
         decomp_count = sum(1 for rd in rows_data if rd[0]["_decomposed"])
         img_count = len([v for v in row_to_header_row.values() if v in img_map])

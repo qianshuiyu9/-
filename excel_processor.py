@@ -1528,7 +1528,8 @@ def _write_output_with_images(df, img_map, row_to_header_row, output_path):
             orig_row_num = row_to_header_row.get(out_row_idx - 2)
             if orig_row_num is not None and orig_row_num in img_map:
                 try:
-                    raw = img_map[orig_row_num]._data()
+                    raw = img_map[orig_row_num]
+                    raw = raw._data() if hasattr(raw, "_data") else raw
                     img_data = _resize_image_bytes(raw, IMG_RES_W, IMG_RES_H)
                 except Exception:
                     img_data = None
@@ -1797,6 +1798,14 @@ def _write_ycjh_retail(df, img_map, row_to_header_row, supplier, out_dir, supp_s
     # 清掉模板里的示例数据行
     if ws.max_row > header_row:
         ws.delete_rows(header_row + 1, ws.max_row - header_row)
+    # 清掉模板自带的示例图片 Shapes（用户说模板只保留表头，不含示例图）
+    for shape in list(ws._images) + list(ws._charts):
+        try:
+            shape.anchor = None
+        except Exception:
+            pass
+    ws._images = []
+    ws._charts = []
     headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, ws.max_column + 1)]
 
     # 列名 → 列索引（1-based）
@@ -1806,43 +1815,48 @@ def _write_ycjh_retail(df, img_map, row_to_header_row, supplier, out_dir, supp_s
                 return i
         return None
 
-    col_product     = col_idx("商品名称")       # 货品名称
-    col_category    = col_idx("商品分类")       # 规格（生活类/玩具类/芭比…）
-    col_price       = col_idx("售价")           # 单价*3.5
-    col_real_item   = col_idx("是否实物商品")   # 是
-    col_unit        = col_idx("单位")           # 个
-    col_supplier    = col_idx("供应商")         # 厂家
-    col_lottery     = col_idx("彩票兑换数量")   # 售价*100 整数
-    col_doll        = col_idx("娃娃兑换数量")   # 单价*0.6 整数
-    col_xcx         = col_idx("小程序兑换")     # 否
-    col_first_cost  = col_idx("首次采购价")     # 单价
-    col_store_cost  = col_idx("门店成本价")     # 单价
-    col_attr        = col_idx("商品属性")       # 实物商品
-    col_image       = col_idx("商品图片")       # 图片
+    col_product     = col_idx("商品名称")
+    col_category    = col_idx("商品分类")
+    col_price       = col_idx("售价")
+    col_real_item   = col_idx("是否实物商品")
+    col_unit        = col_idx("单位")
+    col_supplier    = col_idx("供应商")
+    col_lottery     = col_idx("彩票兑换数量")
+    col_doll        = col_idx("娃娃兑换数量")
+    col_xcx         = col_idx("小程序兑换")
+    col_first_cost  = col_idx("首次采购价")
+    col_store_cost  = col_idx("门店成本价")
+    col_attr        = col_idx("商品属性")
+    col_image       = col_idx("商品图片")
+
+    # 待插入图片：(输出行号1基, 列号1基, 图片字节)
+    # 图片不走 openpyxl（其 oneCellAnchor + 绝对路径 rId Target 结构平台读不到，
+    # 上传后显示为空），改为保存后用 Excel COM AddPicture 插入（twoCellAnchor）。
+    image_items = []
 
     r = header_row + 1
     for df_idx, (_, row) in enumerate(df.iterrows()):
         product = str(row.get("名称", row.get("商品名称", ""))).strip()
-        category = str(row.get("规格", "")).strip()   # 数据处理后的规格
+        category = str(row.get("规格", "")).strip()
         price = float(row.get("单价", 0))
         sale_price = round(price * 3.5, 2)
         lottery_qty = int(round(sale_price * 100))
         doll_qty = int(round(price * 0.6))
 
-        if col_product:   ws.cell(r, col_product, product)
-        if col_category:  ws.cell(r, col_category, category)
-        if col_price:     ws.cell(r, col_price, sale_price)
-        if col_real_item: ws.cell(r, col_real_item, "是")
-        if col_unit:      ws.cell(r, col_unit, "个")
-        if col_supplier:  ws.cell(r, col_supplier, supplier)
-        if col_lottery:   ws.cell(r, col_lottery, lottery_qty)
-        if col_doll:      ws.cell(r, col_doll, doll_qty)
-        if col_xcx:       ws.cell(r, col_xcx, "否")
+        if col_product:    ws.cell(r, col_product, product)
+        if col_category:   ws.cell(r, col_category, category)
+        if col_price:      ws.cell(r, col_price, sale_price)
+        if col_real_item:  ws.cell(r, col_real_item, "是")
+        if col_unit:       ws.cell(r, col_unit, "个")
+        if col_supplier:   ws.cell(r, col_supplier, supplier)
+        if col_lottery:    ws.cell(r, col_lottery, lottery_qty)
+        if col_doll:       ws.cell(r, col_doll, doll_qty)
+        if col_xcx:        ws.cell(r, col_xcx, "否")
         if col_first_cost: ws.cell(r, col_first_cost, price)
         if col_store_cost: ws.cell(r, col_store_cost, price)
-        if col_attr:      ws.cell(r, col_attr, "实物商品")
+        if col_attr:       ws.cell(r, col_attr, "实物商品")
 
-        # 图片：df_idx → 原始 Excel 行号 → img_map（值是 bytes）
+        # 图片：df_idx → 原始 Excel 行号 → img_map（只收集，保存后统一用 COM 插入）
         if col_image and img_map and row_to_header_row:
             orig_row = row_to_header_row.get(df_idx)
             if orig_row is not None and orig_row in img_map:
@@ -1850,17 +1864,23 @@ def _write_ycjh_retail(df, img_map, row_to_header_row, supplier, out_dir, supp_s
                     raw = img_map[orig_row]
                     raw = raw._data() if hasattr(raw, '_data') else raw
                     if isinstance(raw, bytes) and len(raw) > 0:
-                        from openpyxl.drawing.image import Image as XLImage
-                        xl_img = XLImage(io.BytesIO(raw))
-                        xl_img.width = 60
-                        xl_img.height = 60
-                        ws.add_image(xl_img, ws.cell(r, col_image).coordinate)
+                        image_items.append((r, col_image, _resize_image_bytes(raw, 400, 400)))
                 except Exception:
                     pass
 
         r += 1
 
     wb.save(out_path)
+    abs_path = os.path.abspath(out_path)
+
+    if image_items:
+        ok = _insert_images_with_com(abs_path, ws.title, image_items)
+        if not ok:
+            print("    [警告] 油菜花零售表 COM 插图失败，输出文件将不含图片")
+        else:
+            _sanitize_content_types(abs_path)
+    else:
+        _finalize_xlsx_package(abs_path, sheet_name=ws.title)
 
 
 def _write_ycjh_purchase(df, img_map, supplier, store_code, out_dir, supp_stem, orig_stem):
