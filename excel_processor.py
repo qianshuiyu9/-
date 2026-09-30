@@ -1762,10 +1762,10 @@ _YCJH_STORE_CODE = {
 
 
 def _write_ycjh_if_needed(df, img_map, row_to_header_row, supplier, store_name, orig_stem, out_dir):
-    """如果店名包含刘斌/胡欣茹，则再输出油菜花模板文件（零售+采购单）。"""
+    """如果原始文件名包含刘斌/胡欣茹，则再输出油菜花模板文件（零售+采购单）。"""
     matched = None
     for name in ("刘斌", "胡欣茹"):
-        if name in store_name:
+        if name in orig_stem:   # 用原始文件名匹配（胡欣茹在地址后面，store_name可能取不到）
             matched = name
             break
     if matched is None:
