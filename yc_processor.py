@@ -31,6 +31,27 @@ def _parse_yc_file(filepath):
             if v is not None and str(v).strip():
                 customer_name = str(v).strip()
 
+        # 合计金额："合计"行在"金额"列上的值（用于输出文件名）
+        total_amount = None
+        hdr_idx = None
+        for i in range(min(10, len(df_raw))):
+            if str(df_raw.iloc[i, 0]).strip() == "行号":
+                hdr_idx = i
+                break
+        if hdr_idx is not None:
+            amount_col = None
+            for c in range(df_raw.shape[1]):
+                if str(df_raw.iloc[hdr_idx, c]).strip() == "金额":
+                    amount_col = c
+                    break
+            if amount_col is not None:
+                for i in range(hdr_idx + 1, len(df_raw)):
+                    if str(df_raw.iloc[i, 0]).strip() == "合计":
+                        v = df_raw.iloc[i, amount_col]
+                        if pd.notna(v):
+                            total_amount = v
+                        break
+
         df = pd.read_excel(xlsx_path, header=3, dtype=object)
         if "行号" in df.columns:
             df = df[df["行号"].apply(lambda x: isinstance(x, (int, float)) and not pd.isna(x))]
@@ -54,7 +75,7 @@ def _parse_yc_file(filepath):
             if 0 <= pd_idx < len(df):
                 img_map[opxl_row] = raw_bytes
 
-        return {"客户名": customer_name, "df": df, "img_map": img_map}
+        return {"客户名": customer_name, "df": df, "img_map": img_map, "合计金额": total_amount}
 
     finally:
         if ext == ".xls" and os.path.exists(xlsx_path):
@@ -182,6 +203,19 @@ def _round_half_up(v, ndigits=2):
     return float(d)
 
 
+def _fmt_amount(v):
+    """把合计金额格式化成文件名字符串：整数不带小数点，小数最多保留2位."""
+    if v is None:
+        return ""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v).strip()
+    if f == int(f):
+        return str(int(f))
+    return ("%.2f" % f).rstrip("0").rstrip(".")
+
+
 def process_yuanchuang_all(suppliers=None):
     """处理所有原创文件，每个文件一个客户，输出一个文件.
 
@@ -240,12 +274,12 @@ def process_yuanchuang_all(suppliers=None):
 
             category = str(row.get("商品分类", "")).strip()
 
-            # 数量、单价、金额（价格以"折后单价"为准，原"单价"列数据有误）
+            # 数量、单价、金额（价格以原表格"单价"列为准）
             qty_v = row.get("数量")
-            price_v = row.get("折后单价")
+            price_v = row.get("单价")
             try:
                 if pd.isna(price_v) or str(price_v).strip() in ("", "nan", "None"):
-                    price_v = row.get("单价")   # 兜底：折后单价为空时退回原单价
+                    price_v = row.get("折后单价")   # 兜底：单价为空时退回折后单价
             except (TypeError, ValueError):
                 pass
             amount_v = row.get("金额")
@@ -330,10 +364,12 @@ def process_yuanchuang_all(suppliers=None):
                 out_df[c] = ""
         out_df = out_df[final_cols]
 
-        safe_cust = re.sub(r"[\\/:*?\"<>|\n\r\t]+", "_", cust).strip()
-        out_name = f"原创{safe_cust}.xlsx"
-        out_path = os.path.join(out_dir, out_name)
+        # 输出名 = 厂家 + 原表格名称 + 原表格合计金额
         orig_stem = os.path.splitext(os.path.basename(fp))[0]
+        amount_str = _fmt_amount(parsed.get("合计金额"))
+        out_name = f"原创{orig_stem}{amount_str}.xlsx"
+        out_name = re.sub(r"[\\/:*?\"<>|\n\r\t]+", "_", out_name)
+        out_path = os.path.join(out_dir, out_name)
 
         from excel_processor import _write_output_with_images, _write_ycjh_if_needed
 

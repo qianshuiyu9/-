@@ -33,6 +33,11 @@ Desktop.ini
 pyarmor_runtime_000000/
 dist_encrypted/
 *.spec
+
+# 本地打包中间产物（_build.py 生成）
+_bak/
+_build/
+_enc/
 auth.py.orig
 main.py.orig
 

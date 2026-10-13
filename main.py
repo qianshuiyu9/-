@@ -164,7 +164,9 @@ def main():
 if __name__ == "__main__":
     main()
     # GUI 模式退出后不阻塞；CLI 模式保留回车暂停
-    if "--cli" in sys.argv or "--gen-code" in sys.argv:
+    # 注意：窗口版 exe（--windowed）没有控制台，sys.stdin 为 None，
+    # 此时调用 input() 会抛 RuntimeError: lost sys.stdin，必须先判断
+    if ("--cli" in sys.argv or "--gen-code" in sys.argv) and sys.stdin is not None:
         try:
             input("\n按回车键退出...")
         except (EOFError, KeyboardInterrupt):
