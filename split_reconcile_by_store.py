@@ -7,6 +7,7 @@
   - 分公司 / 总部其他 聚合文件（多店合并）
   - 19 / 30 号店（油菜花/娱乐至上平台数据）单独出表：19号店.xlsx / 30号店.xlsx，
     不与 总部其他.xlsx 合并；明细从源文件尾部「采购单/所属门店」明细块解析
+  - 不开票供应商（配置 NO_INVOICE_SUPPLIERS）：其所有门店数据一律并入 总部其他.xlsx，不按门店拆分
   - 文件内一个供应商一个 Sheet；同名 Sheet 已存在则跳过，绝不覆盖 / 删除已有 Sheet
   - 每个输出文件自动从旧「按店铺对账」同名文件复制「汇总」Sheet（收款信息/备注等原样保留，
     跨表公式改写为静态数值），并按本期数据更新金额；新供应商自动加行（收款信息留空待补）；
@@ -40,6 +41,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import supplier_config
+
 # ============================================================
 # 配置区（门店归类 / 供应商规则，均为待替换的默认初值）
 # ============================================================
@@ -57,18 +60,11 @@ BRANCH_SPLIT_CODES = ["45", "48"]                                         # 属�
 HQ_OTHER_CODES     = ["3", "4", "18", "24", "32", "35", "204", "8001", "2302", "2303", "2601"]  # 进 总部其他.xlsx
 INDIVIDUAL_CODES   = ["20", "23", "26", "31", "3401", "4501", "50", "66", "67", "79"]  # 单独门店
 PLATFORM_CODES     = ["19", "30"]  # 油菜花（娱乐至上）平台门店：单独出表，金额按开票口径（与旧 19.xlsx/30.xlsx 一致）
-# 其余未归类门店：默认并入 总部其他.xlsx，运行时日志提示
+# 不开票供应商（及其折扣/开票状态/收款信息）已迁移至 supplier_config.py 的 supplier_config.json，
+# 由 GUI 界面维护，脚本运行时通过 supplier_config 模块动态读取。
 
 # 油菜花（娱乐至上）平台数据：源文件尾部明细块「所属门店」关键词 → 门店编号
 PLATFORM_STORE_MAP = {"红光沃尔玛": "30", "锦江大融城": "19"}
-
-# 供应商规则：discount=折扣系数（0.99=99折），invoice=开票系数（1.01=加一个点，1.0=不加点）
-SUPPLIER_RULES = {
-    "小小玩具": {"discount": 0.99, "invoice": 1.01},
-    "家家乐":   {"discount": 1.00, "invoice": 1.01},
-    "辉鸿":     {"discount": 0.98, "invoice": 1.00},
-}
-DEFAULT_RULE = {"discount": 1.00, "invoice": 1.00}
 
 # 分组标签（决定应付金额取值）
 GROUP_BRANCH = "分公司"
@@ -140,10 +136,8 @@ def clean_sheet_name(name):
 
 
 def supplier_rule(name):
-    r = SUPPLIER_RULES.get(str(name).strip())
-    if not r:
-        return dict(DEFAULT_RULE)
-    return {"discount": float(r.get("discount", 1.0)), "invoice": float(r.get("invoice", 1.0))}
+    """折扣/开票系数：从供应商配置读取（GUI 维护）"""
+    return supplier_config.get_rule(name)
 
 
 def discount_label(d):
@@ -156,8 +150,16 @@ def discount_label(d):
     return f"折扣×{d}"
 
 
-def route(code):
-    """门店编号 → (输出文件名, 分组, 是否未归类)"""
+def route(code, supplier=None):
+    """门店编号 + 供应商 → (输出文件名, 分组, 是否未归类)
+    不开票供应商（按配置）：45/48 单独出表、分公司其他进 分公司.xlsx；
+    其余门店（总部其他、19/30 平台、单独门店）仍统一并入 总部其他.xlsx"""
+    if supplier is not None and supplier_config.is_no_invoice(supplier):
+        if code in BRANCH_SPLIT_CODES:
+            return (f"{code}号店.xlsx", GROUP_BRANCH, False)
+        if code in BRANCH_CODES:
+            return (BRANCH_FILE, GROUP_BRANCH, False)
+        return (HQ_OTHER_FILE, GROUP_HQ, False)
     if code in BRANCH_SPLIT_CODES:
         return (f"{code}号店.xlsx", GROUP_BRANCH, False)
     if code in BRANCH_CODES:
@@ -680,6 +682,55 @@ def update_summary_amounts(ws, formula_cells, amounts, group):
     return added, [s for s in amounts if s in changed], total_changed
 
 
+def _header_cols(ws):
+    """解析「汇总」表头 → {列名: 列号}（行1）"""
+    hdr = {}
+    for j in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=j).value
+        if v is not None:
+            hdr[str(v).strip()] = j
+    return hdr
+
+
+def write_payment_info(ws, sup):
+    """把配置里的「收款信息 / 不开票收款信息 / 备注(开票状态)」写入「汇总」Sheet 对应列。
+    以界面配置为准覆盖旧值；未配置该供应商时跳过。返回是否有单元格被改动。"""
+    cfg = supplier_config.get_supplier(sup)
+    if cfg is None:
+        return False
+    hdr = _header_cols(ws)
+    bank_col = hdr.get("收款信息")
+    nobank_col = hdr.get("不开票收款信息")
+    remark_col = hdr.get("备注")
+    changed = False
+
+    # 定位该供应商所在行
+    row = None
+    for i in range(2, ws.max_row + 1):
+        v = ws.cell(row=i, column=1).value
+        if v is not None and str(v).strip() == str(sup).strip():
+            row = i
+            break
+    if row is None:
+        return False
+
+    def _set(col, val):
+        nonlocal changed
+        if col is None:
+            return
+        c = ws.cell(row=row, column=col)
+        if c.value != val:
+            c.value = val
+            changed = True
+
+    _set(bank_col, cfg.get("bank") or None)
+    _set(nobank_col, cfg.get("no_bank") or None)
+    status = cfg.get("invoice_status") or supplier_config.STATUS_NO_PLUS
+    # 备注列写开票状态（三档文案）
+    _set(remark_col, status)
+    return changed
+
+
 def _text_width(s):
     """文本显示宽度：中文按 2 字符计"""
     return sum(2 if ord(ch) > 127 else 1 for ch in s)
@@ -751,14 +802,10 @@ def fit_summary_columns(ws, max_width=55):
 # ============================================================
 # 主流程
 # ============================================================
-def main():
-    ap = argparse.ArgumentParser(description="按门店拆分供应商对账单并生成金额汇总")
-    ap.add_argument("--input", default=INPUT_DIR, help="源对账文件目录")
-    ap.add_argument("--output", default=OUTPUT_DIR, help="输出目录")
-    args = ap.parse_args()
-
-    input_dir = Path(args.input)
-    output_dir = Path(args.output)
+def run_split(input_dir, output_dir):
+    """核心拆分流程（供 CLI 与 GUI 复用）；日志走 print"""
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
 
     print("=" * 60)
     print("  供应商对账单 - 按门店拆分 + 金额汇总")
@@ -769,13 +816,13 @@ def main():
 
     if not input_dir.exists():
         print(f"  [FAIL] 源目录不存在：{input_dir}")
-        sys.exit(1)
+        return 1
 
     files = sorted(p for p in input_dir.iterdir()
                    if p.suffix.lower() in (".xlsx", ".xlsm") and not p.name.startswith("~$"))
     if not files:
         print("  [FAIL] 源目录下没有可处理的 xlsx 文件")
-        sys.exit(1)
+        return 1
 
     # 读取 + 归类
     print("1. 读取源文件并归类门店...")
@@ -790,7 +837,7 @@ def main():
         print(f"   {f.name}: 有效对账行 {len(recs)}"
               + (f"，油菜花平台行 {len(precs)}" if precs else ""))
         for rec in recs + precs:
-            fn, group, unc = route(rec["code"])
+            fn, group, unc = route(rec["code"], rec["supplier"])
             if unc:
                 unclassified.add(rec["code"])
             key = (fn, rec["supplier"])
@@ -838,6 +885,14 @@ def main():
         else:
             wb = Workbook()
             wb.remove(wb.active)
+        # 不开票供应商 45/48/分公司 现已合法拆出，残留检测仅针对不应出现不开票 sheet 的文件
+        no_inv_ok = {HQ_OTHER_FILE, BRANCH_FILE}
+        no_inv_ok.update(f"{c}号店.xlsx" for c in BRANCH_SPLIT_CODES)
+        if fn not in no_inv_ok:
+            stale = [s for s in wb.sheetnames if supplier_config.is_no_invoice(s)]
+            if stale:
+                print(f"   [WARN] {fn} 存在不开票供应商的旧 Sheet（{'、'.join(stale)}）："
+                      f"按规则其数据不应出现在本文件，如需清理请手动删除该 Sheet")
         wrote_any = False
         for sup, it in items:
             sheet_name = clean_sheet_name(sup)
@@ -855,6 +910,7 @@ def main():
         summary_changed = False
         amounts = {sup: calc_unrounded(it["rows"], supplier_rule(sup))
                    for sup, it in items}
+        payment_changed = False
         if "汇总" in wb.sheetnames:
             added, changed, tot_changed = update_summary_amounts(
                 wb["汇总"], set(), amounts, items[0][1]["group"])
@@ -865,6 +921,13 @@ def main():
                       + ("，含新增供应商行（收款信息待补）" if added else ""))
             else:
                 print(f"   [SKIP] {fn} 已有「汇总」，金额与本期一致")
+            # 以界面配置为准：同步收款信息 / 开票状态备注
+            for sup, _ in items:
+                if write_payment_info(wb["汇总"], sup):
+                    payment_changed = True
+            if payment_changed:
+                summary_changed = True
+                print(f"   [OK]   {fn} 已按配置同步「汇总」收款信息/开票状态")
             if fit_summary_columns(wb["汇总"]):
                 summary_changed = True
                 print(f"   [OK]   {fn} 已自适应「汇总」列宽/行高（内容完整显示）")
@@ -875,6 +938,9 @@ def main():
             else:
                 ws_sum, fcells = copy_summary_sheet(src, wb)
                 added, _, _ = update_summary_amounts(ws_sum, fcells, amounts, items[0][1]["group"])
+                for sup, _ in items:
+                    if write_payment_info(ws_sum, sup):
+                        payment_changed = True
                 fit_summary_columns(ws_sum)
                 summary_changed = True
                 print(f"   [OK]   {fn} 已复制旧「汇总」并按本期数据更新金额"
@@ -919,6 +985,14 @@ def main():
         print(f"  [WARN] 新门店未归类，已默认并入 {HQ_OTHER_FILE}："
               + "、".join(sorted(unclassified, key=int)) + "号店")
     print(f"  输出目录：{output_dir}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="按门店拆分供应商对账单并生成金额汇总")
+    ap.add_argument("--input", default=INPUT_DIR, help="源对账文件目录")
+    ap.add_argument("--output", default=OUTPUT_DIR, help="输出目录")
+    args = ap.parse_args()
+    run_split(args.input, args.output)
 
 
 if __name__ == "__main__":
