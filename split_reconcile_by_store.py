@@ -209,13 +209,43 @@ def is_number(v):
 # ============================================================
 # 读取源表
 # ============================================================
-def read_reconcile_rows(path):
-    """读取一个源文件的有效对账行（门店匹配 'N号店' 且下单金额为数值）"""
+def _read_rows(path):
+    """按后缀读取首个 sheet 的全部行 → list[list]（对齐 openpyxl iter_rows 语义）"""
+    if path.suffix.lower() == ".xls":
+        return _read_xls_rows(path)
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
-    all_rows = list(ws.iter_rows(values_only=True))
+    all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
     wb.close()
+    return all_rows
 
+
+def _read_xls_rows(path):
+    """xlrd 读取 .xls 全部行，空单元格转 None、日期转 datetime"""
+    import xlrd
+    book = xlrd.open_workbook(str(path))
+    sheet = book.sheet_by_index(0)
+    rows = []
+    for i in range(sheet.nrows):
+        row = []
+        for j in range(sheet.ncols):
+            cell = sheet.cell(i, j)
+            if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                row.append(None)
+            elif cell.ctype == xlrd.XL_CELL_DATE:
+                try:
+                    row.append(xlrd.xldate_as_datetime(cell.value, book.datemode))
+                except Exception:
+                    row.append(cell.value)
+            else:
+                row.append(cell.value)
+        rows.append(row)
+    return rows
+
+
+def read_reconcile_rows(path):
+    """读取一个源文件的有效对账行（门店匹配 'N号店' 且下单金额为数值）"""
+    all_rows = _read_rows(path)
     hdr_i, col = None, {}
     for i, r in enumerate(all_rows[:20]):
         vals = [str(v).strip() if v is not None else "" for v in r]
@@ -272,11 +302,7 @@ def read_reconcile_rows(path):
 def read_platform_rows(path):
     """读取源文件尾部油菜花（娱乐至上）平台明细块（表头含「采购单」+「所属门店」）。
     金额：付款说明(K)为数值时优先取之，否则取金额(D)；优惠(备注M)不额外扣减（与旧文件一致）。"""
-    wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-    all_rows = list(ws.iter_rows(values_only=True))
-    wb.close()
-
+    all_rows = _read_rows(path)
     hdr_i, col = None, {}
     for i, r in enumerate(all_rows):
         vals = [str(v).strip() if v is not None else "" for v in r]
@@ -615,6 +641,22 @@ def _summary_layout(ws):
     return dcol, ccol, ecol, tcol, basis
 
 
+def remove_absent_suppliers(ws, amounts):
+    """删除「汇总」Sheet 中不在本期源文件夹供应商的整行（厂家名、收款信息、金额一并移除）。
+    新建表格时调用：旧模板里含历史供应商，不在本期 amounts 中的整行删除，
+    只保留源文件夹中存在的供应商。"""
+    del_rows = []
+    for i in range(2, ws.max_row + 1):
+        name = ws.cell(row=i, column=1).value
+        if name is None or not str(name).strip():
+            continue
+        if str(name).strip() in amounts:
+            continue
+        del_rows.append(i)
+    for i in reversed(del_rows):   # 自下而上删除，避免行号偏移
+        ws.delete_rows(i)
+
+
 def _close(a, b):
     """单元格数值比较（容忍浮点尾差；None 视作 0）"""
     x = float(a) if is_number(a) else 0.0
@@ -821,7 +863,7 @@ def run_split(input_dir, output_dir):
         return 1
 
     files = sorted(p for p in input_dir.iterdir()
-                   if p.suffix.lower() in (".xlsx", ".xlsm") and not p.name.startswith("~$"))
+                   if p.suffix.lower() in (".xlsx", ".xlsm", ".xls") and not p.name.startswith("~$"))
     if not files:
         print("  [FAIL] 源目录下没有可处理的 xlsx 文件")
         return 1
@@ -942,6 +984,7 @@ def run_split(input_dir, output_dir):
                 print(f"   [WARN] {fn} 未找到旧汇总模板（{OLD_DIR}），本次不生成「汇总」Sheet")
             else:
                 ws_sum, fcells = copy_summary_sheet(src, wb)
+                remove_absent_suppliers(ws_sum, amounts)
                 added, _, _ = update_summary_amounts(ws_sum, fcells, amounts, items[0][1]["group"])
                 for sup, _ in items:
                     if write_payment_info(ws_sum, sup):
