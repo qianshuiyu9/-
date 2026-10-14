@@ -660,13 +660,13 @@ def remove_absent_suppliers(ws, amounts):
 def _summary_headers(group, fn):
     """无旧模板时为「汇总」Sheet 生成的表头列（None 表示占位空列）"""
     if group == GROUP_HQ:
-        return ["厂家", "收款信息", "不开票收款信息", "不开票金额", "金额", "备注"]
+        return ["厂家", "收款信息", "不开票收款信息", "不开票金额", "金额", "备注", "总计"]
     if group == GROUP_SINGLE:
-        return ["厂家", "收款信息", "金额", "备注"]
+        return ["厂家", "收款信息", "金额", "备注", "总计"]
     # GROUP_BRANCH：分公司聚合 vs 45/48 单店（不开票口径）
     if Path(fn).name == BRANCH_FILE:
-        return ["厂家", "收款信息", "不开票收款信息", "不开票金额", "开票金额", "备注"]
-    return ["厂家", "收款信息", "金额", None, "总计", None]
+        return ["厂家", "收款信息", "不开票收款信息", "不开票金额", "开票金额", "备注", "总计"]
+    return ["厂家", "收款信息", "金额", "总计"]
 
 
 def create_summary_sheet(wb, group, fn):
@@ -728,14 +728,19 @@ def update_summary_amounts(ws, formula_cells, amounts, group):
             added.append(sup)
             changed.add(sup)
         if dcol:
-            if not _close(ws.cell(row=i, column=dcol).value, no_inv):
+            # 两列布局（总部其他/分公司）：不开票→不开票金额列，开票→金额/开票金额列
+            no_inv_sup = supplier_config.is_no_invoice(sup)
+            put_col = dcol if no_inv_sup else ecol
+            other_col = ecol if no_inv_sup else dcol
+            val = no_inv if no_inv_sup else inv
+            put_cell = ws.cell(row=i, column=put_col)
+            if not _close(put_cell.value, val):
                 changed.add(sup)
-            ws.cell(row=i, column=dcol, value=no_inv)
-            have_e = ws.cell(row=i, column=ecol).value is not None or (i, ecol) in formula_cells
-            if have_e:
-                if not _close(ws.cell(row=i, column=ecol).value, inv):
-                    changed.add(sup)
-                ws.cell(row=i, column=ecol, value=inv)
+            put_cell.value = val
+            other_cell = ws.cell(row=i, column=other_col)
+            if other_cell.value is not None:
+                changed.add(sup)
+                other_cell.value = None          # 清空非本类别的金额列
         elif ccol:
             target = inv if group == GROUP_SINGLE else no_inv
             if not _close(ws.cell(row=i, column=ccol).value, target):
@@ -744,16 +749,16 @@ def update_summary_amounts(ws, formula_cells, amounts, group):
 
     total_changed = False
     if tcol:
-        total = sum((Decimal(str(ws.cell(row=i, column=basis).value))
-                     for i in existing.values()
-                     if is_number(ws.cell(row=i, column=basis).value)), Decimal("0"))
+        # 汇总所有厂家金额：不开票取不开票金额，开票取开票金额
+        total = sum((Decimal(str(no_inv if supplier_config.is_no_invoice(sup) else inv))
+                     for sup, (no_inv, inv) in amounts.items()), Decimal("0"))
         cand = sorted(r for (r, c) in formula_cells if c == tcol)
         if not cand:                               # 已存在「汇总」（公式已转静态）：取该列最靠上的数值单元格
             cand = [i for i in range(2, ws.max_row + 1)
                     if is_number(ws.cell(row=i, column=tcol).value)]
         if cand:
             tcell = ws.cell(row=cand[0], column=tcol)
-        else:                                      # 新建的 45/48 表：总计放在首个数据行（与原模板一致）
+        else:                                      # 新建表：总计放在首个数据行
             tcell = ws.cell(row=2, column=tcol)
         total_changed = not _close(tcell.value, float(total))
         tcell.value = float(total)                 # 写静态值（与旧文件一致）
