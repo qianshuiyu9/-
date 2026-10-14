@@ -277,3 +277,27 @@ def delete_store(code):
     cfg = load_config()
     cfg.setdefault("stores", {}).pop(str(code).strip(), None)
     save_config(cfg)
+
+
+# ============ 目录路径 ============
+
+def get_paths():
+    """返回界面选择的目录：{input, output, old}；未设置时为空字符串"""
+    cfg = load_config()
+    p = cfg.get("paths") or {}
+    return {
+        "input": p.get("input", ""),
+        "output": p.get("output", ""),
+        "old": p.get("old", ""),
+    }
+
+
+def save_paths(input_dir, output_dir, old_dir=""):
+    """保存界面选择的源 / 输出 / 旧模板目录"""
+    cfg = load_config()
+    cfg["paths"] = {
+        "input": (input_dir or "").strip(),
+        "output": (output_dir or "").strip(),
+        "old": (old_dir or "").strip(),
+    }
+    save_config(cfg)

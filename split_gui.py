@@ -11,7 +11,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import supplier_config
 
@@ -200,6 +200,25 @@ class App(tk.Tk):
 
     # ---------- UI ----------
     def _build_ui(self):
+        import split_reconcile_by_store as engine
+
+        paths = supplier_config.get_paths()
+        self.default_input = engine.INPUT_DIR
+        self.default_output = engine.OUTPUT_DIR
+        self.var_input = tk.StringVar(value=paths["input"] or self.default_input)
+        self.var_output = tk.StringVar(value=paths["output"] or self.default_output)
+
+        # 目录选择
+        dirf = ttk.LabelFrame(self, text="目录设置", padding=(8, 4))
+        dirf.pack(fill="x", padx=8, pady=(8, 0))
+        dirf.columnconfigure(1, weight=1)
+        ttk.Label(dirf, text="源目录(供应商账单)").grid(row=0, column=0, sticky="e", padx=4, pady=3)
+        ttk.Entry(dirf, textvariable=self.var_input).grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        ttk.Button(dirf, text="选择…", command=lambda: self._pick_dir(self.var_input)).grid(row=0, column=2, padx=4, pady=3)
+        ttk.Label(dirf, text="输出目录(门店对账)").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        ttk.Entry(dirf, textvariable=self.var_output).grid(row=1, column=1, sticky="ew", padx=4, pady=3)
+        ttk.Button(dirf, text="选择…", command=lambda: self._pick_dir(self.var_output)).grid(row=1, column=2, padx=4, pady=3)
+
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
         ttk.Button(top, text="执行拆分", command=self._run_split).pack(side="right", padx=4)
@@ -365,10 +384,21 @@ class App(tk.Tk):
         return sel[0] if sel else None
 
     # ---------- 拆分 ----------
+    def _pick_dir(self, var):
+        cur = var.get().strip()
+        d = filedialog.askdirectory(initialdir=cur or None, title="选择目录")
+        if d:
+            var.set(d)
+            self._save_paths()
+
+    def _save_paths(self):
+        supplier_config.save_paths(self.var_input.get(), self.var_output.get())
+
     def _open_output(self):
-        import split_reconcile_by_store as engine
         import os
-        os.startfile(engine.OUTPUT_DIR)
+        out = self.var_output.get().strip() or self.default_output
+        os.makedirs(out, exist_ok=True)
+        os.startfile(out)
 
     def _run_split(self):
         for child in self.winfo_children():
@@ -377,10 +407,13 @@ class App(tk.Tk):
                 break
         if self.run_btn:
             self.run_btn.config(state="disabled")
+        self._save_paths()
+        inp = self.var_input.get().strip() or self.default_input
+        out = self.var_output.get().strip() or self.default_output
         self._log("开始拆分...\n")
-        threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._worker, args=(inp, out), daemon=True).start()
 
-    def _worker(self):
+    def _worker(self, inp, out):
         import io
         import contextlib
         import split_reconcile_by_store as engine
@@ -388,7 +421,7 @@ class App(tk.Tk):
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                engine.run_split(engine.INPUT_DIR, engine.OUTPUT_DIR)
+                engine.run_split(inp, out)
         except Exception:
             import traceback
             traceback.print_exc(file=buf)
