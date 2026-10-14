@@ -34,6 +34,30 @@ SEED_RULES = {
 SEED_NO_INVOICE = ["新晨", "澄海玩具", "恒盛", "多乐", "先坤", "米可", "瑞熙", "魅力", "有利", "琳雅"]
 SEED_OLD_DIR = r"C:\Users\Administrator\Desktop\按店铺对账"
 
+# ----- 门店归属配置（三档） -----
+STORE_GROUP_SPLIT  = "单独拆分"   # 门店单独出一个文件 {编号}号店.xlsx
+STORE_GROUP_HQ     = "总部其他"   # 并入 总部其他.xlsx
+STORE_GROUP_BRANCH = "分公司"     # 并入 分公司.xlsx
+STORE_GROUPS = [STORE_GROUP_SPLIT, STORE_GROUP_HQ, STORE_GROUP_BRANCH]
+
+INVOICE_ON  = "开票"
+INVOICE_OFF = "不开票"
+INVOICE_MODES = [INVOICE_ON, INVOICE_OFF]
+
+# 门店种子清单（首次初始化 / 老配置补全时写入）：编号 → {group, invoice}
+#   group 三档：单独拆分 / 总部其他 / 分公司
+#   invoice 仅「单独拆分」有意义：开票=普通单店/平台店，不开票=45/48 口径
+SEED_STORES = {
+    **{c: {"group": STORE_GROUP_BRANCH, "invoice": INVOICE_OFF}
+       for c in ["10", "37", "38", "41", "44", "46", "49", "4401", "4402", "4701"]},
+    **{c: {"group": STORE_GROUP_SPLIT, "invoice": INVOICE_OFF}
+       for c in ["45", "48"]},
+    **{c: {"group": STORE_GROUP_SPLIT, "invoice": INVOICE_ON}
+       for c in ["19", "30", "20", "23", "26", "31", "3401", "4501", "50", "66", "67", "79"]},
+    **{c: {"group": STORE_GROUP_HQ, "invoice": INVOICE_OFF}
+       for c in ["3", "4", "18", "24", "32", "35", "204", "8001", "2302", "2303", "2601"]},
+}
+
 STATUS_NO_INVOICE = "不开票"
 STATUS_NO_PLUS    = "开票不加点"
 STATUS_PLUS       = "开票加一个点"
@@ -146,10 +170,18 @@ def init_config(old_dir=SEED_OLD_DIR):
             "bank": rec.get("bank", ""),
             "no_bank": rec.get("no_bank", ""),
         }
-    return {"suppliers": suppliers}
+    return {"suppliers": suppliers, "stores": {c: dict(s) for c, s in SEED_STORES.items()}}
 
 
 _cache = {"config": None}
+
+
+def _ensure_stores(cfg):
+    """确保配置里含「stores」段；缺失或为空则用种子补全并返回 True（表示需落盘）"""
+    if cfg.get("stores"):
+        return False
+    cfg["stores"] = {c: dict(s) for c, s in SEED_STORES.items()}
+    return True
 
 
 def load_config(force_reload=False):
@@ -162,6 +194,8 @@ def load_config(force_reload=False):
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             cfg.setdefault("suppliers", {})
+            if _ensure_stores(cfg):
+                save_config(cfg)
             _cache["config"] = cfg
             return cfg
         except (json.JSONDecodeError, OSError):
@@ -212,3 +246,34 @@ def get_rule(name):
         status = s.get("invoice_status") or STATUS_NO_PLUS
     invoice = 1.01 if status == STATUS_PLUS else 1.00
     return {"discount": discount, "invoice": invoice}
+
+
+# ============ 门店归属 ============
+
+def get_store(code):
+    """返回门店配置 {group, invoice}；未配置返回 None"""
+    cfg = load_config()
+    return cfg.get("stores", {}).get(str(code).strip())
+
+
+def get_store_names():
+    """全部门店编号（字符串）"""
+    cfg = load_config()
+    return list(cfg.get("stores", {}).keys())
+
+
+def upsert_store(code, group, invoice):
+    """新增/更新一个门店归属并落盘"""
+    cfg = load_config()
+    cfg.setdefault("stores", {})[str(code).strip()] = {
+        "group": group,
+        "invoice": invoice,
+    }
+    save_config(cfg)
+
+
+def delete_store(code):
+    """删除一个门店归属"""
+    cfg = load_config()
+    cfg.setdefault("stores", {}).pop(str(code).strip(), None)
+    save_config(cfg)

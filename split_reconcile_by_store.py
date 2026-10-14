@@ -54,13 +54,7 @@ SUMMARY_NAME = "门店金额汇总.xlsx"
 BRANCH_FILE   = "分公司.xlsx"
 HQ_OTHER_FILE = "总部其他.xlsx"
 
-# 门店归类清单
-BRANCH_CODES       = ["10", "37", "38", "41", "44", "46", "49", "4401", "4402", "4701"]  # 进 分公司.xlsx
-BRANCH_SPLIT_CODES = ["45", "48"]                                         # 属分公司，但单独出表（不开票）
-HQ_OTHER_CODES     = ["3", "4", "18", "24", "32", "35", "204", "8001", "2302", "2303", "2601"]  # 进 总部其他.xlsx
-INDIVIDUAL_CODES   = ["20", "23", "26", "31", "3401", "4501", "50", "66", "67", "79"]  # 单独门店
-PLATFORM_CODES     = ["19", "30"]  # 油菜花（娱乐至上）平台门店：单独出表，金额按开票口径（与旧 19.xlsx/30.xlsx 一致）
-# 不开票供应商（及其折扣/开票状态/收款信息）已迁移至 supplier_config.py 的 supplier_config.json，
+# 门店归属 + 供应商规则（开票状态/折扣/收款信息）已迁移至 supplier_config.py 的 supplier_config.json，
 # 由 GUI 界面维护，脚本运行时通过 supplier_config 模块动态读取。
 
 # 油菜花（娱乐至上）平台数据：源文件尾部明细块「所属门店」关键词 → 门店编号
@@ -152,24 +146,32 @@ def discount_label(d):
 
 def route(code, supplier=None):
     """门店编号 + 供应商 → (输出文件名, 分组, 是否未归类)
-    不开票供应商（按配置）：45/48 单独出表、分公司其他进 分公司.xlsx；
-    其余门店（总部其他、19/30 平台、单独门店）仍统一并入 总部其他.xlsx"""
+    门店归属三档（GUI 维护，supplier_config.stores）：单独拆分 / 总部其他 / 分公司；
+    「单独拆分」再按 invoice 口径分：开票=GROUP_SINGLE，不开票=GROUP_BRANCH。
+    不开票供应商：仅「单独拆分(不开票口径)」「分公司」两类门店拆出，其余并入 总部其他.xlsx"""
+    code = str(code).strip()
+    store = supplier_config.get_store(code)
+
     if supplier is not None and supplier_config.is_no_invoice(supplier):
-        if code in BRANCH_SPLIT_CODES:
-            return (f"{code}号店.xlsx", GROUP_BRANCH, False)
-        if code in BRANCH_CODES:
-            return (BRANCH_FILE, GROUP_BRANCH, False)
+        if store is not None:
+            g = store.get("group")
+            if g == supplier_config.STORE_GROUP_BRANCH:
+                return (BRANCH_FILE, GROUP_BRANCH, False)
+            if (g == supplier_config.STORE_GROUP_SPLIT
+                    and store.get("invoice") == supplier_config.INVOICE_OFF):
+                return (f"{code}号店.xlsx", GROUP_BRANCH, False)
         return (HQ_OTHER_FILE, GROUP_HQ, False)
-    if code in BRANCH_SPLIT_CODES:
-        return (f"{code}号店.xlsx", GROUP_BRANCH, False)
-    if code in BRANCH_CODES:
+
+    if store is None:
+        return (HQ_OTHER_FILE, GROUP_HQ, True)
+    g = store.get("group")
+    if g == supplier_config.STORE_GROUP_BRANCH:
         return (BRANCH_FILE, GROUP_BRANCH, False)
-    if code in PLATFORM_CODES:
-        return (f"{code}号店.xlsx", GROUP_SINGLE, False)
-    if code in HQ_OTHER_CODES:
+    if g == supplier_config.STORE_GROUP_HQ:
         return (HQ_OTHER_FILE, GROUP_HQ, False)
-    if code in INDIVIDUAL_CODES:
-        return (f"{code}号店.xlsx", GROUP_SINGLE, False)
+    if g == supplier_config.STORE_GROUP_SPLIT:
+        grp = GROUP_SINGLE if store.get("invoice") == supplier_config.INVOICE_ON else GROUP_BRANCH
+        return (f"{code}号店.xlsx", grp, False)
     return (HQ_OTHER_FILE, GROUP_HQ, True)
 
 
@@ -885,9 +887,12 @@ def run_split(input_dir, output_dir):
         else:
             wb = Workbook()
             wb.remove(wb.active)
-        # 不开票供应商 45/48/分公司 现已合法拆出，残留检测仅针对不应出现不开票 sheet 的文件
+        # 不开票供应商合法去向：总部其他、分公司、以及「单独拆分+不开票口径」的门店文件（如45/48）
         no_inv_ok = {HQ_OTHER_FILE, BRANCH_FILE}
-        no_inv_ok.update(f"{c}号店.xlsx" for c in BRANCH_SPLIT_CODES)
+        no_inv_ok.update(
+            f"{c}号店.xlsx" for c, s in supplier_config.load_config().get("stores", {}).items()
+            if s.get("group") == supplier_config.STORE_GROUP_SPLIT
+            and s.get("invoice") == supplier_config.INVOICE_OFF)
         if fn not in no_inv_ok:
             stale = [s for s in wb.sheetnames if supplier_config.is_no_invoice(s)]
             if stale:
