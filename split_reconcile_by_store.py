@@ -657,6 +657,33 @@ def remove_absent_suppliers(ws, amounts):
         ws.delete_rows(i)
 
 
+def _summary_headers(group, fn):
+    """无旧模板时为「汇总」Sheet 生成的表头列（None 表示占位空列）"""
+    if group == GROUP_HQ:
+        return ["厂家", "收款信息", "不开票收款信息", "不开票金额", "金额", "备注"]
+    if group == GROUP_SINGLE:
+        return ["厂家", "收款信息", "金额", "备注"]
+    # GROUP_BRANCH：分公司聚合 vs 45/48 单店（不开票口径）
+    if Path(fn).name == BRANCH_FILE:
+        return ["厂家", "收款信息", "不开票收款信息", "不开票金额", "开票金额", "备注"]
+    return ["厂家", "收款信息", "金额", None, "总计", None]
+
+
+def create_summary_sheet(wb, group, fn):
+    """无旧模板时，按分组/文件类型新建「汇总」Sheet（仅表头 + 样式），返回 ws"""
+    headers = _summary_headers(group, fn)
+    ws = wb.create_sheet("汇总", 0)
+    for j, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=j)
+        if h is not None:
+            c.value = h
+        c.fill = HEADER_FILL
+        c.font = HEADER_FONT
+        c.border = THIN_BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    return ws
+
+
 def _close(a, b):
     """单元格数值比较（容忍浮点尾差；None 视作 0）"""
     x = float(a) if is_number(a) else 0.0
@@ -682,15 +709,20 @@ def update_summary_amounts(ws, formula_cells, amounts, group):
             i = existing[sup]
         else:
             i = ws.max_row + 1
-            src_row = max(existing.values()) if existing else 1
+            src_row = max(existing.values()) if existing else 0
             for j in range(1, ws.max_column + 1):
-                sc, nc = ws.cell(row=src_row, column=j), ws.cell(row=i, column=j)
-                nc.font = copy(sc.font)            # 同工作簿内复制样式对象
-                nc.fill = copy(sc.fill)
-                nc.border = copy(sc.border)
-                nc.alignment = copy(sc.alignment)
-                nc.protection = copy(sc.protection)
-                nc.number_format = sc.number_format
+                nc = ws.cell(row=i, column=j)
+                if src_row:
+                    sc = ws.cell(row=src_row, column=j)
+                    nc.font = copy(sc.font)            # 同工作簿内复制样式对象
+                    nc.fill = copy(sc.fill)
+                    nc.border = copy(sc.border)
+                    nc.alignment = copy(sc.alignment)
+                    nc.protection = copy(sc.protection)
+                    nc.number_format = sc.number_format
+                else:                                  # 全新表（仅有表头）：用默认数据样式，避免套用表头加粗
+                    nc.border = THIN_BORDER
+                    nc.alignment = Alignment(vertical="center")
             ws.cell(row=i, column=1, value=sup)
             existing[sup] = i
             added.append(sup)
@@ -721,8 +753,10 @@ def update_summary_amounts(ws, formula_cells, amounts, group):
                     if is_number(ws.cell(row=i, column=tcol).value)]
         if cand:
             tcell = ws.cell(row=cand[0], column=tcol)
-            total_changed = not _close(tcell.value, float(total))
-            tcell.value = float(total)             # 写静态值（与旧文件一致）
+        else:                                      # 新建的 45/48 表：总计放在首个数据行（与原模板一致）
+            tcell = ws.cell(row=2, column=tcol)
+        total_changed = not _close(tcell.value, float(total))
+        tcell.value = float(total)                 # 写静态值（与旧文件一致）
     return added, [s for s in amounts if s in changed], total_changed
 
 
@@ -979,13 +1013,22 @@ def run_split(input_dir, output_dir):
                 summary_changed = True
                 print(f"   [OK]   {fn} 已自适应「汇总」列宽/行高（内容完整显示）")
         else:
+            group = items[0][1]["group"]
             src = old_summary_source(fn)
             if src is None:
-                print(f"   [WARN] {fn} 未找到旧汇总模板（{OLD_DIR}），本次不生成「汇总」Sheet")
+                ws_sum = create_summary_sheet(wb, group, fn)   # 无旧模板：从配置新建（收款信息来自界面配置）
+                fcells = set()
+                added, _, _ = update_summary_amounts(ws_sum, fcells, amounts, group)
+                for sup, _ in items:
+                    if write_payment_info(ws_sum, sup):
+                        payment_changed = True
+                fit_summary_columns(ws_sum)
+                summary_changed = True
+                print(f"   [OK]   {fn} 无旧模板，已按界面配置新建「汇总」Sheet")
             else:
                 ws_sum, fcells = copy_summary_sheet(src, wb)
                 remove_absent_suppliers(ws_sum, amounts)
-                added, _, _ = update_summary_amounts(ws_sum, fcells, amounts, items[0][1]["group"])
+                added, _, _ = update_summary_amounts(ws_sum, fcells, amounts, group)
                 for sup, _ in items:
                     if write_payment_info(ws_sum, sup):
                         payment_changed = True
