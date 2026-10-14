@@ -728,19 +728,23 @@ def update_summary_amounts(ws, formula_cells, amounts, group):
             added.append(sup)
             changed.add(sup)
         if dcol:
-            # 两列布局（总部其他/分公司）：不开票→不开票金额列，开票→金额/开票金额列
+            # 两列布局（总部其他/分公司）：
+            #   不开票金额列：所有厂家都填（= 折后未加点总额，即 calc_unrounded 的 no_inv）
+            #   金额/开票金额列：开票厂家填开票金额（inv），不开票厂家该列清空
             no_inv_sup = supplier_config.is_no_invoice(sup)
-            put_col = dcol if no_inv_sup else ecol
-            other_col = ecol if no_inv_sup else dcol
-            val = no_inv if no_inv_sup else inv
-            put_cell = ws.cell(row=i, column=put_col)
-            if not _close(put_cell.value, val):
+            dcell = ws.cell(row=i, column=dcol)
+            if not _close(dcell.value, no_inv):
                 changed.add(sup)
-            put_cell.value = val
-            other_cell = ws.cell(row=i, column=other_col)
-            if other_cell.value is not None:
-                changed.add(sup)
-                other_cell.value = None          # 清空非本类别的金额列
+            dcell.value = no_inv
+            ecell = ws.cell(row=i, column=ecol)
+            if no_inv_sup:
+                if ecell.value is not None:
+                    changed.add(sup)
+                    ecell.value = None
+            else:
+                if not _close(ecell.value, inv):
+                    changed.add(sup)
+                ecell.value = inv
         elif ccol:
             target = inv if group == GROUP_SINGLE else no_inv
             if not _close(ws.cell(row=i, column=ccol).value, target):
