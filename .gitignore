@@ -38,6 +38,7 @@ dist_encrypted/
 _bak/
 _build/
 _enc/
+build_split/
 auth.py.orig
 main.py.orig
 
