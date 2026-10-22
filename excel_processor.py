@@ -1232,7 +1232,7 @@ def parse_spec_and_recalc(row, supplier_name="", deal_amount=None):
         row["名称"] = original_name
         row["展示名"] = original_name  # 糖果展示名不清理
         row["规格"] = spec_val
-        row["用途"] = "兑换, 零售"
+        row["用途"] = "礼品机,兑换"
         row["标签"] = tag_val
         row["单位"] = "个"
         row["进货数量"] = qty if qty != 0 else ""
